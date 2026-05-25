@@ -1,508 +1,33 @@
 import asyncio
-import contextlib
 import json
-import logging
 import os
-import signal
+import logging
 import socket
 from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
+from typing import Optional
 
 import uvicorn
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.routing import Mount
-
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
-
-from mcpo.utils.auth import APIKeyMiddleware, get_verify_api_key
-from mcpo.utils.main import (
-    get_model_fields,
-    get_tool_handler,
-    normalize_server_type,
-)
-from mcpo.utils.config_watcher import ConfigWatcher
-from mcpo.utils.headers import validate_client_header_forwarding_config
-from mcpo.utils.oauth import create_oauth_provider
-
+from starlette.routing import Mount
 
 logger = logging.getLogger(__name__)
 
-CONNECTION_TIMEOUT = os.getenv("CONNECTION_TIMEOUT", None)
 
-
-class GracefulShutdown:
-    def __init__(self):
-        self.shutdown_event = asyncio.Event()
-        self.tasks = set()
-
-    def handle_signal(self, sig, frame=None):
-        """Handle shutdown signals gracefully"""
-        logger.info(
-            f"\nReceived {signal.Signals(sig).name}, initiating graceful shutdown..."
-        )
-        self.shutdown_event.set()
-
-    def track_task(self, task):
-        """Track tasks for cleanup"""
-        self.tasks.add(task)
-        task.add_done_callback(self.tasks.discard)
-
-
-class MCPConnectionManager:
-    """
-    Manages lifecycle of the MCP ClientSession and underlying transport so that
-    we can reconnect transparently when the remote server drops the connection.
-    """
-
-    def __init__(
-        self,
-        *,
-        server_type: str,
-        command: Optional[str],
-        args: List[str],
-        env: Dict[str, str],
-        headers: Optional[Dict[str, str]],
-        connection_timeout: Optional[int],
-        auth_provider: Optional[Any] = None,
-    ):
-        self.server_type = normalize_server_type(server_type)
-        self.command = command
-        self.args = args
-        self.env = env
-        self.headers = headers
-        self.connection_timeout = connection_timeout
-        self.auth_provider = auth_provider
-
-        self._session: Optional[ClientSession] = None
-        self._client_context = None
-        self._lock = asyncio.Lock()
-        self._initialize_lock = asyncio.Lock()
-        self._initialize_result = None
-        self._initialized = False
-
-    @property
-    def current_session(self) -> Optional[ClientSession]:
-        return self._session
-
-    async def get_session(self) -> ClientSession:
-        async with self._lock:
-            if self._session is None:
-                await self._open_session_locked()
-            return self._session
-
-    async def ensure_initialized(self):
-        session = await self.get_session()
-        if self._initialized and self._initialize_result is not None:
-            return session, self._initialize_result
-
-        async with self._initialize_lock:
-            if not self._initialized or self._initialize_result is None:
-                initialize_result = await session.initialize()
-                self._initialize_result = initialize_result
-                self._initialized = True
-            else:
-                initialize_result = self._initialize_result
-
-        return session, initialize_result
-
-    async def reconnect(self):
-        async with self._lock:
-            await self._close_session_locked()
-            await self._open_session_locked()
-        # Run initialize outside of the lock to avoid deadlocks on nested calls
-        return await self.ensure_initialized()
-
-    async def close(self):
-        async with self._lock:
-            await self._close_session_locked()
-
-    async def _open_session_locked(self):
-        client_context = self._create_client_context()
-        try:
-            connection = await client_context.__aenter__()
-        except Exception:
-            # Ensure the context is closed if entering fails
-            with contextlib.suppress(Exception):
-                await client_context.__aexit__(None, None, None)
-            raise
-
-        reader, writer, *_ = connection
-        session = ClientSession(reader, writer)
-        try:
-            await session.__aenter__()
-        except Exception:
-            with contextlib.suppress(Exception):
-                await session.__aexit__(None, None, None)
-            with contextlib.suppress(Exception):
-                await client_context.__aexit__(None, None, None)
-            raise
-
-        self._client_context = client_context
-        self._session = session
-        self._initialized = False
-        self._initialize_result = None
-
-    async def _close_session_locked(self):
-        session, client_context = self._session, self._client_context
-        self._session = None
-        self._client_context = None
-        self._initialized = False
-        self._initialize_result = None
-
-        if session is not None:
-            with contextlib.suppress(Exception):
-                await session.__aexit__(None, None, None)
-
-        if client_context is not None:
-            with contextlib.suppress(Exception):
-                await client_context.__aexit__(None, None, None)
-
-    def _create_client_context(self):
-        if self.server_type == "stdio":
-            server_params = StdioServerParameters(
-                command=self.command,
-                args=self.args,
-                env={**os.environ, **self.env},
-            )
-            return stdio_client(server_params)
-        if self.server_type == "sse":
-            timeout = self.connection_timeout or 900
-            return sse_client(
-                url=self.args[0],
-                sse_read_timeout=timeout,
-                headers=self.headers,
-            )
-        if self.server_type == "streamable-http":
-            return streamablehttp_client(
-                url=self.args[0],
-                headers=self.headers,
-                auth=self.auth_provider,
-            )
-        raise ValueError(f"Unsupported server type: {self.server_type}")
-
-
-def validate_server_config(server_name: str, server_cfg: Dict[str, Any]) -> None:
-    """Validate individual server configuration."""
-    server_type = server_cfg.get("type")
-
-    if normalize_server_type(server_type) in ("sse", "streamable-http"):
-        if not server_cfg.get("url"):
-            raise ValueError(
-                f"Server '{server_name}' of type '{server_type}' requires a 'url' field"
-            )
-    elif server_cfg.get("command"):
-        # stdio server
-        if not isinstance(server_cfg["command"], str):
-            raise ValueError(f"Server '{server_name}' 'command' must be a string")
-        if server_cfg.get("args") and not isinstance(server_cfg["args"], list):
-            raise ValueError(f"Server '{server_name}' 'args' must be a list")
-    elif server_cfg.get("url") and not server_type:
-        # Fallback for old SSE config without explicit type
-        pass
-    else:
-        raise ValueError(f"Server '{server_name}' must have either 'command' for stdio or 'type' and 'url' for remote servers")
-    
-    # Validate disabledTools (supports camelCase & snake_case for backwards compatibility)
-    disabled_tools = server_cfg.get("disabledTools")
-    if disabled_tools is None:
-        disabled_tools = server_cfg.get("disabled_tools")
-    if disabled_tools is not None:
-        if not isinstance(disabled_tools, list):
-            raise ValueError(f"Server '{server_name}' 'disabledTools' must be a list")
-        for tool_name in disabled_tools:
-            if not isinstance(tool_name, str):
-                raise ValueError(f"Server '{server_name}' 'disabledTools' must contain only strings")
-
-
-def load_config(config_path: str) -> Dict[str, Any]:
-    """Load and validate config from file."""
-    try:
-        with open(config_path, "r") as f:
-            config_data = json.load(f)
-
-        mcp_servers = config_data.get("mcpServers", {})
-        if not mcp_servers:
-            logger.error(f"No 'mcpServers' found in config file: {config_path}")
-            raise ValueError("No 'mcpServers' found in config file.")
-
-        # Validate each server configuration
-        for server_name, server_cfg in mcp_servers.items():
-            validate_server_config(server_name, server_cfg)
-
-            # Validate client header forwarding configuration if present
-            header_config = server_cfg.get("client_header_forwarding", {})
-            if header_config:
-                validate_client_header_forwarding_config(server_name, header_config)
-
-        return config_data
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in config file {config_path}: {e}")
-        raise
-    except FileNotFoundError:
-        logger.error(f"Config file not found: {config_path}")
-        raise
-    except ValueError as e:
-        logger.error(f"Invalid configuration: {e}")
-        raise
-
-
-def create_sub_app(
-    server_name: str,
-    server_cfg: Dict[str, Any],
-    cors_allow_origins,
-    api_key: Optional[str],
-    strict_auth: bool,
-    api_dependency,
-    connection_timeout,
-    lifespan,
-) -> FastAPI:
-    """Create a sub-application for an MCP server."""
-    sub_app = FastAPI(
-        title=f"{server_name}",
-        description=f"{server_name} MCP Server\n\n- [back to tool list](/docs)",
-        version="1.0",
-        lifespan=lifespan,
-    )
-
-    sub_app.add_middleware(
-        CORSMiddleware,
-        allow_origins=cors_allow_origins or ["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # Configure server type and connection parameters
-    if server_cfg.get("command"):
-        # stdio
-        sub_app.state.server_type = "stdio"
-        sub_app.state.command = server_cfg["command"]
-        sub_app.state.args = server_cfg.get("args", [])
-        sub_app.state.env = {**os.environ, **server_cfg.get("env", {})}
-
-    server_config_type = server_cfg.get("type")
-    if server_config_type == "sse" and server_cfg.get("url"):
-        sub_app.state.server_type = "sse"
-        sub_app.state.args = [server_cfg["url"]]
-        sub_app.state.headers = server_cfg.get("headers")
-    elif normalize_server_type(
-        server_config_type
-    ) == "streamable-http" and server_cfg.get("url"):
-        url = server_cfg["url"]
-        sub_app.state.server_type = "streamablehttp"
-        sub_app.state.args = [url]
-        sub_app.state.headers = server_cfg.get("headers")
-    elif not server_config_type and server_cfg.get(
-        "url"
-    ):  # Fallback for old SSE config
-        sub_app.state.server_type = "sse"
-        sub_app.state.args = [server_cfg["url"]]
-        sub_app.state.headers = server_cfg.get("headers")
-
-    if api_key and strict_auth:
-        sub_app.add_middleware(APIKeyMiddleware, api_key=api_key)
-
-    sub_app.state.api_dependency = api_dependency
-    sub_app.state.connection_timeout = connection_timeout
-
-    # Store list of tools to be disabled, if present (accept both key styles)
-    disabled_tools = server_cfg.get("disabledTools")
-    if disabled_tools is None:
-        disabled_tools = server_cfg.get("disabled_tools", [])
-    sub_app.state.disabled_tools = disabled_tools
-
-    
-    # Store client header forwarding configuration
-    sub_app.state.client_header_forwarding = server_cfg.get(
-        "client_header_forwarding", {"enabled": False}
-    )
-
-    # Store OAuth configuration if present
-    sub_app.state.oauth_config = server_cfg.get("oauth")
-
-
-    return sub_app
-
-
-def mount_config_servers(
-    main_app: FastAPI,
-    config_data: Dict[str, Any],
-    cors_allow_origins,
-    api_key: Optional[str],
-    strict_auth: bool,
-    api_dependency,
-    connection_timeout,
-    lifespan,
-    path_prefix: str,
-):
-    """Mount MCP servers from config data."""
-    mcp_servers = config_data.get("mcpServers", {})
-
-    logger.info("Configuring MCP Servers:")
-    for server_name, server_cfg in mcp_servers.items():
-        sub_app = create_sub_app(
-            server_name,
-            server_cfg,
-            cors_allow_origins,
-            api_key,
-            strict_auth,
-            api_dependency,
-            connection_timeout,
-            lifespan,
-        )
-        main_app.mount(f"{path_prefix}{server_name}", sub_app)
-
-
-def unmount_servers(main_app: FastAPI, path_prefix: str, server_names: list):
-    """Unmount specific MCP servers."""
-    active_lifespans = getattr(main_app.state, "active_lifespans", {})
-
-    for server_name in server_names:
-        mount_path = f"{path_prefix}{server_name}"
-
-        # Clean up lifespan context if it exists
-        if server_name in active_lifespans:
-            lifespan_context = active_lifespans[server_name]
-            try:
-                # Schedule cleanup of the lifespan context
-                asyncio.create_task(lifespan_context.__aexit__(None, None, None))
-            except Exception as e:
-                logger.warning(f"Error cleaning up lifespan for {server_name}: {e}")
-            finally:
-                del active_lifespans[server_name]
-
-
-async def reload_config_handler(main_app: FastAPI, new_config_data: Dict[str, Any]):
-    """Handle config reload by comparing and updating mounted servers."""
-    old_config_data = getattr(main_app.state, "config_data", {})
-    backup_routes = list(main_app.router.routes)  # Backup current routes for rollback
-
-    try:
-        old_servers = set(old_config_data.get("mcpServers", {}).keys())
-        new_servers = set(new_config_data.get("mcpServers", {}).keys())
-
-        # Find servers to add, remove, and potentially update
-        servers_to_add = new_servers - old_servers
-        servers_to_remove = old_servers - new_servers
-        servers_to_check = old_servers & new_servers
-
-        # Get app configuration from state
-        cors_allow_origins = getattr(main_app.state, "cors_allow_origins", ["*"])
-        api_key = getattr(main_app.state, "api_key", None)
-        strict_auth = getattr(main_app.state, "strict_auth", False)
-        api_dependency = getattr(main_app.state, "api_dependency", None)
-        connection_timeout = getattr(main_app.state, "connection_timeout", None)
-        lifespan = getattr(main_app.state, "lifespan", None)
-        path_prefix = getattr(main_app.state, "path_prefix", "/")
-
-        # Remove servers that are no longer in config
-        if servers_to_remove:
-            logger.info(f"Removing servers: {list(servers_to_remove)}")
-            unmount_servers(main_app, path_prefix, list(servers_to_remove))
-
-        # Check for configuration changes in existing servers
-        servers_to_update = []
-        for server_name in servers_to_check:
-            old_cfg = old_config_data["mcpServers"][server_name]
-            new_cfg = new_config_data["mcpServers"][server_name]
-            if old_cfg != new_cfg:
-                servers_to_update.append(server_name)
-
-        # Remove and re-add updated servers
-        if servers_to_update:
-            logger.info(f"Updating servers: {servers_to_update}")
-            unmount_servers(main_app, path_prefix, servers_to_update)
-            servers_to_add.update(servers_to_update)
-
-        # Add new servers and updated servers
-        if servers_to_add:
-            logger.info(f"Adding servers: {list(servers_to_add)}")
-
-            # Store lifespan contexts for cleanup
-            if not hasattr(main_app.state, "active_lifespans"):
-                main_app.state.active_lifespans = {}
-
-            for server_name in servers_to_add:
-                server_cfg = new_config_data["mcpServers"][server_name]
-                try:
-                    sub_app = create_sub_app(
-                        server_name,
-                        server_cfg,
-                        cors_allow_origins,
-                        api_key,
-                        strict_auth,
-                        api_dependency,
-                        connection_timeout,
-                        lifespan,
-                    )
-                    main_app.mount(f"{path_prefix}{server_name}", sub_app)
-
-                    # Start the lifespan for the new sub-app when available
-                    lifespan_context = None
-                    lifespan_factory = getattr(sub_app.router, "lifespan_context", None)
-                    if lifespan_factory:
-                        lifespan_context = lifespan_factory(sub_app)
-                    if lifespan_context and hasattr(lifespan_context, "__aenter__"):
-                        await lifespan_context.__aenter__()
-                        # Store the context manager for cleanup later
-                        main_app.state.active_lifespans[server_name] = lifespan_context
-                    else:
-                        logger.debug(
-                            "Skipping lifespan startup for server '%s' (no async context manager)",
-                            server_name,
-                        )
-
-                    # Check if connection was successful
-                    is_connected = getattr(sub_app.state, "is_connected", False)
-                    if is_connected:
-                        logger.info(
-                            f"Successfully connected to new server: '{server_name}'"
-                        )
-                    else:
-                        logger.warning(
-                            f"Failed to connect to new server: '{server_name}'"
-                        )
-
-                except asyncio.CancelledError as e:
-                    logger.error(f"Failed to create server '{server_name}' (cancelled): {e}")
-                    # Rollback on failure
-                    main_app.router.routes = backup_routes
-                    raise
-                except Exception as e:
-                    logger.error(f"Failed to create server '{server_name}': {e}")
-                    # Rollback on failure
-                    main_app.router.routes = backup_routes
-                    raise
-
-        # Update stored config data only after successful reload
-        main_app.state.config_data = new_config_data
-        logger.info("Config reload completed successfully")
-
-    except Exception as e:
-        logger.error(f"Error during config reload, keeping previous configuration: {e}")
-        # Ensure we're back to the original state
-        main_app.router.routes = backup_routes
-        raise
+from mcpo.utils.main import get_model_fields, get_tool_handler
+from mcpo.utils.auth import get_verify_api_key, APIKeyMiddleware
 
 
 async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
-    session_manager: Optional[MCPConnectionManager] = getattr(
-        app.state, "session_manager", None
-    )
+    session: ClientSession = app.state.session
+    if not session:
+        raise ValueError("Session is not initialized in the app state.")
 
-    if session_manager:
-        session, result = await session_manager.ensure_initialized()
-        app.state.session = session
-    else:
-        session: Optional[ClientSession] = getattr(app.state, "session", None)
-        if not session:
-            raise ValueError("Session is not initialized in the app state.")
-        result = await session.initialize()
+    result = await session.initialize()
     server_info = getattr(result, "serverInfo", None)
     if server_info:
         app.title = server_info.name or app.title
@@ -511,21 +36,8 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
         )
         app.version = server_info.version or app.version
 
-    instructions = getattr(result, "instructions", None)
-    if instructions:
-        app.description = instructions
-
     tools_result = await session.list_tools()
     tools = tools_result.tools
-    
-    # Filter out disabled tools
-    disabled_tools = getattr(app.state, "disabled_tools", [])
-    if disabled_tools:
-        original_count = len(tools)
-        tools = [tool for tool in tools if tool.name not in disabled_tools]
-        filtered_count = original_count - len(tools)
-        if filtered_count > 0:
-            logger.info(f"Filtered out {filtered_count} tool(s) for server '{app.title}': {disabled_tools}")
 
     for tool in tools:
         endpoint_name = tool.name
@@ -538,7 +50,8 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
             f"{endpoint_name}_form_model",
             inputSchema.get("properties", {}),
             inputSchema.get("required", []),
-            inputSchema.get("$defs", {}),
+            schema_defs=inputSchema.get("$defs", {}),
+            root_schema=inputSchema,
         )
 
         response_model_fields = None
@@ -547,19 +60,15 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
                 f"{endpoint_name}_response_model",
                 outputSchema.get("properties", {}),
                 outputSchema.get("required", []),
-                outputSchema.get("$defs", {}),
+                schema_defs=outputSchema.get("$defs", {}),
+                root_schema=outputSchema,
             )
 
-        # Get client header forwarding configuration from app state
-        client_header_forwarding_config = getattr(
-            app.state, "client_header_forwarding", {"enabled": False}
-        )
-
         tool_handler = get_tool_handler(
+            session,
             endpoint_name,
             form_model_fields,
             response_model_fields,
-            client_header_forwarding_config,
         )
 
         app.post(
@@ -571,169 +80,184 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
         )(tool_handler)
 
 
+async def start_server_connection_background(sub_app: FastAPI):
+    """Start server connection in background without blocking main app startup"""
+    try:
+        logger.info(f"🔄 Starting background connection for server...")
+        async with sub_app.router.lifespan_context(sub_app):
+            # Keep connection alive
+            while True:
+                await asyncio.sleep(30)  # Health check every 30 seconds
+    except Exception as e:
+        logger.error(f"❌ Background server connection failed: {e}")
+        # Store error status for health endpoints
+        sub_app.state.connection_error = str(e)
+        sub_app.state.connection_status = "failed"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    server_type = normalize_server_type(getattr(app.state, "server_type", "stdio"))
+    server_type = getattr(app.state, "server_type", "stdio")
     command = getattr(app.state, "command", None)
     args = getattr(app.state, "args", [])
-    args = args if isinstance(args, list) else [args]
     env = getattr(app.state, "env", {})
-    connection_timeout = getattr(app.state, "connection_timeout", CONNECTION_TIMEOUT)
+
+    args = args if isinstance(args, list) else [args]
     api_dependency = getattr(app.state, "api_dependency", None)
-    path_prefix = getattr(app.state, "path_prefix", "/")
 
-    # Get shutdown handler from app state
-    shutdown_handler = getattr(app.state, "shutdown_handler", None)
-
-    is_main_app = not command and not (
-        server_type in ["sse", "streamable-http"] and args
-    )
-
-    if is_main_app:
-        async with AsyncExitStack() as stack:
-            successful_servers = []
-            failed_servers = []
-
-            sub_lifespans = [
-                (route.app, route.app.router.lifespan_context(route.app))
-                for route in app.routes
-                if isinstance(route, Mount) and isinstance(route.app, FastAPI)
-            ]
-
-            for sub_app, lifespan_context in sub_lifespans:
-                server_name = sub_app.title
-                logger.info(f"Initiating connection for server: '{server_name}'...")
-                try:
-                    await stack.enter_async_context(lifespan_context)
-                    is_connected = getattr(sub_app.state, "is_connected", False)
-                    if is_connected:
-                        logger.info(f"Successfully connected to '{server_name}'.")
-                        successful_servers.append(server_name)
-                    else:
-                        logger.warning(
-                            f"Connection attempt for '{server_name}' finished, but status is not 'connected'."
-                        )
-                        failed_servers.append(server_name)
-                except asyncio.CancelledError as e:
-                    if shutdown_handler and shutdown_handler.shutdown_event.is_set():
-                        raise
-                    logger.error(
-                        f"Failed to establish connection for server: '{server_name}' - CancelledError: {e}",
-                        exc_info=True,
-                    )
-                    failed_servers.append(server_name)
-                except Exception as e:
-                    error_class_name = type(e).__name__
-                    if error_class_name == "ExceptionGroup" or (
-                        hasattr(e, "exceptions") and hasattr(e, "message")
-                    ):
-                        logger.error(
-                            f"Failed to establish connection for server: '{server_name}' - Multiple errors occurred:"
-                        )
-                        # Log each individual exception from the group
-                        exceptions = getattr(e, "exceptions", [])
-                        for idx, exc in enumerate(exceptions):
-                            logger.error(
-                                f"  Error {idx + 1}: {type(exc).__name__}: {exc}"
-                            )
-                            # Also log traceback for each exception
-                            if hasattr(exc, "__traceback__"):
-                                import traceback
-
-                                tb_lines = traceback.format_exception(
-                                    type(exc), exc, exc.__traceback__
-                                )
-                                for line in tb_lines:
-                                    logger.debug(f"    {line.rstrip()}")
-                    else:
-                        logger.error(
-                            f"Failed to establish connection for server: '{server_name}' - {type(e).__name__}: {e}",
-                            exc_info=True,
-                        )
-                    failed_servers.append(server_name)
-
-            logger.info("\n--- Server Startup Summary ---")
-            if successful_servers:
-                logger.info("Successfully connected to:")
-                for name in successful_servers:
-                    logger.info(f"  - {name}")
-                app.description += "\n\n- **available tools**："
-                for name in successful_servers:
-                    docs_path = urljoin(path_prefix, f"{name}/docs")
-                    app.description += f"\n    - [{name}]({docs_path})"
-            if failed_servers:
-                logger.warning("Failed to connect to:")
-                for name in failed_servers:
-                    logger.warning(f"  - {name}")
-            logger.info("--------------------------\n")
-
-            if not successful_servers:
-                logger.error("No MCP servers could be reached.")
-
-            yield
-            # The AsyncExitStack will handle the graceful shutdown of all servers
-            # when the 'with' block is exited.
-    else:
-        # This is a sub-app's lifespan
-        app.state.is_connected = False
+    if (server_type == "stdio" and not command) or (
+        server_type == "sse" and not args[0]
+    ):
+        # Main app lifespan (when config_path is provided)
+        # NON-BLOCKING STARTUP: Don't wait for sub-apps to connect
+        logger.info("🚀 Starting main app immediately (non-blocking mode)")
+        
+        # Start all server connections in background
+        connection_tasks = []
+        for route in app.routes:
+            if isinstance(route, Mount) and isinstance(route.app, FastAPI):
+                # Start connection task in background instead of waiting
+                task = asyncio.create_task(
+                    start_server_connection_background(route.app)
+                )
+                connection_tasks.append(task)
+        
+        # Store tasks for cleanup later
+        app.state.connection_tasks = connection_tasks
+        
         try:
-            # Check for OAuth configuration
-            oauth_config = getattr(app.state, "oauth_config", None)
-            auth_provider = None
-
-            if oauth_config:
-                server_name = app.title
-                logger.info(f"OAuth configuration detected for server: {server_name}")
-                try:
-                    auth_provider = await create_oauth_provider(
-                        server_name=server_name,
-                        oauth_config=oauth_config,
-                        storage_type=oauth_config.get("storage_type", "file"),
-                    )
-                    logger.info(f"OAuth provider created for server: {server_name}")
-                except Exception as e:
-                    logger.error(
-                        f"Failed to create OAuth provider for {server_name}: {e}"
-                    )
-                    raise
-
-            if oauth_config and server_type == "stdio":
-                logger.warning("OAuth not supported for stdio server type")
-            if oauth_config and server_type == "sse":
-                logger.warning("OAuth not supported for SSE server type")
-
-            headers = getattr(app.state, "headers", None)
-            session_manager = MCPConnectionManager(
-                server_type=server_type,
+            yield  # App is ready immediately!
+        finally:
+            # Cleanup background tasks
+            for task in connection_tasks:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+    else:
+        if server_type == "stdio":
+            server_params = StdioServerParameters(
                 command=command,
                 args=args,
-                env=env,
-                headers=headers,
-                connection_timeout=connection_timeout,
-                auth_provider=auth_provider,
+                env={**env},
             )
-            app.state.session_manager = session_manager
 
-            session = await session_manager.get_session()
-            app.state.session = session
-            await create_dynamic_endpoints(app, api_dependency=api_dependency)
-            app.state.is_connected = True
-            yield
-        except Exception as e:
-            # Log the full exception with traceback for debugging
-            logger.error(
-                f"Failed to connect to MCP server '{app.title}': {type(e).__name__}: {e}",
-                exc_info=True,
-            )
-            app.state.is_connected = False
-            # Re-raise the exception so it propagates to the main app's lifespan
-            raise
-        finally:
-            session_manager = getattr(app.state, "session_manager", None)
-            if session_manager:
-                await session_manager.close()
-                app.state.session_manager = None
+            async with stdio_client(server_params) as (reader, writer):
+                async with ClientSession(reader, writer) as session:
+                    app.state.session = session
+                    await create_dynamic_endpoints(app, api_dependency=api_dependency)
+                    yield
+        if server_type == "sse":
+            from httpx import ConnectError, ConnectTimeout
+            
+            # Production retry strategy - retry indefinitely with backoff
+            max_retry_delay = 60  # Cap retry delay at 1 minute
+            retry_delay = 2
+            continuous_retry_interval = 30  # 30 seconds for continuous retries
+            
+            # Classify errors for smart retry logic
+            def is_permanent_error(error_str):
+                permanent_indicators = [
+                    "authentication", "unauthorized", "forbidden", "not found",
+                    "invalid", "malformed", "certificate", "ssl"
+                ]
+                return any(indicator in error_str.lower() for indicator in permanent_indicators)
+            
+            # Initialize state
+            app.state.sse_server_status = "connecting"
+            app.state.sse_last_error = None
             app.state.session = None
+            
+            # Background connection task with retry logic
+            async def maintain_sse_connection():
+                retry_delay = 2
+                attempt = 0
+                
+                while True:
+                    attempt += 1
+                    try:
+                        logger.info(f"Connecting to SSE endpoint: {args[0]} (attempt {attempt})")
+                        async with sse_client(url=args[0], sse_read_timeout=None) as (
+                            reader,
+                            writer,
+                        ):
+                            logger.info(f"✅ Successfully connected to SSE endpoint: {args[0]}")
+                            async with ClientSession(reader, writer) as session:
+                                app.state.session = session
+                                app.state.sse_server_status = "healthy"
+                                
+                                # Create dynamic endpoints when connection succeeds
+                                await create_dynamic_endpoints(app, api_dependency=api_dependency)
+                                
+                                # Keep the connection alive until it fails
+                                try:
+                                    # Keep connection alive by periodically checking
+                                    while True:
+                                        await asyncio.sleep(60)  # Check every 60 seconds
+                                        # Try to list tools to verify connection is alive
+                                        await session.list_tools()
+                                except Exception as disconnect_error:
+                                    logger.warning(f"SSE connection lost for {args[0]}: {disconnect_error}")
+                                    app.state.sse_server_status = "unhealthy"
+                                    app.state.session = None
+                                    
+                        # Reset retry delay on successful connection
+                        retry_delay = 2
+                                    
+                    except Exception as e:
+                        last_error = str(e)
+                        logger.warning(f"❌ Failed to connect to SSE endpoint {args[0]} (attempt {attempt}): {e}")
+                        app.state.sse_last_error = last_error
+                        
+                        # Stop retrying for permanent errors
+                        if is_permanent_error(last_error):
+                            logger.error(f"🚫 Permanent error detected for {args[0]}. Stopping retries: {e}")
+                            app.state.sse_server_status = "error"
+                            return
+                        
+                        # Set status as unhealthy but keep retrying
+                        app.state.sse_server_status = "unhealthy"
+                        
+                        # Exponential backoff with cap
+                        current_delay = min(retry_delay, max_retry_delay)
+                        logger.info(f"⏰ Retrying in {current_delay} seconds...")
+                        await asyncio.sleep(current_delay)
+                        
+                        # Increase delay for next attempt (capped)
+                        retry_delay = min(retry_delay * 1.5, max_retry_delay)
+            
+            # Start background connection task
+            connection_task = asyncio.create_task(maintain_sse_connection())
+            
+            # Yield immediately to start the application
+            try:
+                yield
+            finally:
+                # Cleanup on shutdown
+                if not connection_task.done():
+                    connection_task.cancel()
+                    try:
+                        await connection_task
+                    except asyncio.CancelledError:
+                        pass
+        if server_type == "streamablehttp" or server_type == "streamable_http":
+            # Ensure URL has trailing slash to avoid redirects
+            url = args[0]
+            if not url.endswith("/"):
+                url = f"{url}/"
+
+            # Connect using streamablehttp_client from the SDK, similar to sse_client
+            async with streamablehttp_client(url=url) as (
+                reader,
+                writer,
+                _,  # get_session_id callback not needed for ClientSession
+            ):
+                async with ClientSession(reader, writer) as session:
+                    app.state.session = session
+                    await create_dynamic_endpoints(app, api_dependency=api_dependency)
+                    yield
 
 
 async def run(
@@ -743,14 +267,14 @@ async def run(
     cors_allow_origins=["*"],
     **kwargs,
 ):
-    hot_reload = kwargs.get("hot_reload", False)
     # Server API Key
     api_dependency = get_verify_api_key(api_key) if api_key else None
-    connection_timeout = kwargs.get("connection_timeout", None)
     strict_auth = kwargs.get("strict_auth", False)
 
     # MCP Server
-    server_type = normalize_server_type(kwargs.get("server_type"))
+    server_type = kwargs.get(
+        "server_type"
+    )  # "stdio", "sse", or "streamablehttp" ("streamable_http" is also accepted)
     server_command = kwargs.get("server_command")
 
     # MCP Config
@@ -766,32 +290,11 @@ async def run(
     ssl_certfile = kwargs.get("ssl_certfile")
     ssl_keyfile = kwargs.get("ssl_keyfile")
     path_prefix = kwargs.get("path_prefix") or "/"
-    root_path = kwargs.get("root_path") or ""
 
-    # Configure logging based on LOG_LEVEL environment variable
-    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    try:
-        numeric_level = getattr(logging, log_level, None)
-        if not isinstance(numeric_level, int):
-            raise ValueError(f"Invalid log level: {log_level}")
-    except (ValueError, AttributeError):
-        logger.warning(f"Invalid LOG_LEVEL '{log_level}', defaulting to INFO")
-        numeric_level = logging.INFO
-
+    # Configure basic logging
     logging.basicConfig(
-        level=numeric_level, format="%(asctime)s - %(levelname)s - %(message)s"
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
     )
-
-    # Suppress HTTP request logs
-    class HTTPRequestFilter(logging.Filter):
-        def filter(self, record):
-            return not (
-                record.levelname == "INFO" and "HTTP Request:" in record.getMessage()
-            )
-
-    # Apply filter to suppress HTTP request logs
-    logging.getLogger("uvicorn.access").addFilter(HTTPRequestFilter())
-    logging.getLogger("httpx.access").addFilter(HTTPRequestFilter())
     logger.info("Starting MCPO Server...")
     logger.info(f"  Name: {name}")
     logger.info(f"  Version: {version}")
@@ -805,24 +308,15 @@ async def run(
     if ssl_keyfile:
         logger.info(f"  SSL Key File: {ssl_keyfile}")
     logger.info(f"  Path Prefix: {path_prefix}")
-    logger.info(f"  Root Path: {root_path}")
-
-    # Create shutdown handler
-    shutdown_handler = GracefulShutdown()
 
     main_app = FastAPI(
         title=name,
         description=description,
         version=version,
-        root_path=root_path,
         ssl_certfile=ssl_certfile,
         ssl_keyfile=ssl_keyfile,
         lifespan=lifespan,
     )
-
-    # Pass shutdown handler to app state
-    main_app.state.shutdown_handler = shutdown_handler
-    main_app.state.path_prefix = path_prefix
 
     main_app.add_middleware(
         CORSMiddleware,
@@ -836,13 +330,31 @@ async def run(
     if api_key and strict_auth:
         main_app.add_middleware(APIKeyMiddleware, api_key=api_key)
 
-    headers = kwargs.get("headers")
-    if headers and isinstance(headers, str):
-        try:
-            headers = json.loads(headers)
-        except json.JSONDecodeError:
-            logger.warning("Invalid JSON format for headers. Headers will be ignored.")
-            headers = None
+    # Add Nova MCP Marketplace APIs
+    try:
+        logger.info("Adding Nova MCP Marketplace APIs...")
+        from mcpo.mcp_management import apply_monkey_patch
+        from mcpo.environment_management import apply_environment_patch
+        apply_monkey_patch(main_app)
+        apply_environment_patch(main_app)
+        logger.info("✅ Nova MCP Marketplace APIs added successfully!")
+        
+        # Enable hot reload for zero-downtime config changes
+        if config_path:
+            logger.info("Enabling hot reload for zero-downtime config changes...")
+            try:
+                from mcpo.hot_reload import apply_hot_reload_patch
+                apply_hot_reload_patch(main_app, config_path)
+                logger.info("✅ Zero-downtime hot reload enabled!")
+            except ImportError as e:
+                logger.warning(f"Full hot reload dependencies not available ({e}), falling back to simple hot reload...")
+                from mcpo.simple_hot_reload import apply_simple_hot_reload
+                apply_simple_hot_reload(main_app, config_path)
+                logger.info("✅ Simple hot reload enabled!")
+        else:
+            logger.info("Note: Hot reload disabled (no config file provided)")
+    except Exception as e:
+        logger.warning(f"Failed to add marketplace APIs: {e}")
 
     if server_type == "sse":
         logger.info(
@@ -851,15 +363,13 @@ async def run(
         main_app.state.server_type = "sse"
         main_app.state.args = server_command[0]  # Expects URL as the first element
         main_app.state.api_dependency = api_dependency
-        main_app.state.headers = headers
-    elif server_type == "streamable-http":
+    elif server_type == "streamablehttp" or server_type == "streamable_http":
         logger.info(
             f"Configuring for a single StreamableHTTP MCP Server with URL {server_command[0]}"
         )
-        main_app.state.server_type = "streamable-http"
+        main_app.state.server_type = "streamablehttp"
         main_app.state.args = server_command[0]  # Expects URL as the first element
         main_app.state.api_dependency = api_dependency
-        main_app.state.headers = headers
     elif server_command:  # This handles stdio
         logger.info(
             f"Configuring for a single Stdio MCP Server with command: {' '.join(server_command)}"
@@ -871,127 +381,112 @@ async def run(
         main_app.state.api_dependency = api_dependency
     elif config_path:
         logger.info(f"Loading MCP server configurations from: {config_path}")
-        config_data = load_config(config_path)
-        mount_config_servers(
-            main_app,
-            config_data,
-            cors_allow_origins,
-            api_key,
-            strict_auth,
-            api_dependency,
-            connection_timeout,
-            lifespan,
-            path_prefix,
-        )
+        with open(config_path, "r") as f:
+            config_data = json.load(f)
 
-        # Store config info and app state for hot reload
-        main_app.state.config_path = config_path
-        main_app.state.config_data = config_data
-        main_app.state.cors_allow_origins = cors_allow_origins
-        main_app.state.api_key = api_key
-        main_app.state.strict_auth = strict_auth
-        main_app.state.api_dependency = api_dependency
-        main_app.state.connection_timeout = connection_timeout
-        main_app.state.lifespan = lifespan
-        main_app.state.path_prefix = path_prefix
+        mcp_servers = config_data.get("mcpServers", {})
+        if not mcp_servers:
+            logger.error(f"No 'mcpServers' found in config file: {config_path}")
+            raise ValueError("No 'mcpServers' found in config file.")
+
+        logger.info("Configured MCP Servers:")
+        for server_name_cfg, server_cfg_details in mcp_servers.items():
+            if server_cfg_details.get("command"):
+                args_info = (
+                    f" with args: {server_cfg_details['args']}"
+                    if server_cfg_details.get("args")
+                    else ""
+                )
+                logger.info(
+                    f"  Configuring Stdio MCP Server '{server_name_cfg}' with command: {server_cfg_details['command']}{args_info}"
+                )
+            elif server_cfg_details.get("type") == "sse" and server_cfg_details.get(
+                "url"
+            ):
+                logger.info(
+                    f"  Configuring SSE MCP Server '{server_name_cfg}' with URL: {server_cfg_details['url']}"
+                )
+            elif (
+                server_cfg_details.get("type") == "streamablehttp"
+                or server_cfg_details.get("type") == "streamable_http"
+            ) and server_cfg_details.get("url"):
+                logger.info(
+                    f"  Configuring StreamableHTTP MCP Server '{server_name_cfg}' with URL: {server_cfg_details['url']}"
+                )
+            elif server_cfg_details.get("url"):  # Fallback for old SSE config
+                logger.info(
+                    f"  Configuring SSE (fallback) MCP Server '{server_name_cfg}' with URL: {server_cfg_details['url']}"
+                )
+            else:
+                logger.warning(
+                    f"  Unknown configuration for MCP server: {server_name_cfg}"
+                )
+
+        main_app.description += "\n\n- **available tools**："
+        for server_name, server_cfg in mcp_servers.items():
+            sub_app = FastAPI(
+                title=f"{server_name}",
+                description=f"{server_name} MCP Server\n\n- [back to tool list](/docs)",
+                version="1.0",
+                lifespan=lifespan,
+            )
+
+            sub_app.add_middleware(
+                CORSMiddleware,
+                allow_origins=cors_allow_origins or ["*"],
+                allow_credentials=True,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
+
+            if server_cfg.get("command"):
+                # stdio
+                sub_app.state.server_type = "stdio"
+                sub_app.state.command = server_cfg["command"]
+                sub_app.state.args = server_cfg.get("args", [])
+                sub_app.state.env = {**os.environ, **server_cfg.get("env", {})}
+
+            server_config_type = server_cfg.get("type")
+            if server_config_type == "sse" and server_cfg.get("url"):
+                sub_app.state.server_type = "sse"
+                sub_app.state.args = server_cfg["url"]
+            elif (
+                server_config_type == "streamablehttp"
+                or server_config_type == "streamable_http"
+            ) and server_cfg.get("url"):
+                # Store the URL with trailing slash to avoid redirects
+                url = server_cfg["url"]
+                if not url.endswith("/"):
+                    url = f"{url}/"
+                sub_app.state.server_type = "streamablehttp"
+                sub_app.state.args = url
+            elif not server_config_type and server_cfg.get(
+                "url"
+            ):  # Fallback for old SSE config
+                sub_app.state.server_type = "sse"
+                sub_app.state.args = server_cfg["url"]
+
+            # Add middleware to protect also documentation and spec
+            if api_key and strict_auth:
+                sub_app.add_middleware(APIKeyMiddleware, api_key=api_key)
+
+            sub_app.state.api_dependency = api_dependency
+
+            main_app.mount(f"{path_prefix}{server_name}", sub_app)
+            main_app.description += f"\n    - [{server_name}](/{server_name}/docs)"
     else:
         logger.error("MCPO server_command or config_path must be provided.")
         raise ValueError("You must provide either server_command or config.")
 
-    # Setup hot reload if enabled and config_path is provided
-    config_watcher = None
-    if hot_reload and config_path:
-        logger.info(f"Enabling hot reload for config file: {config_path}")
-
-        async def reload_callback(new_config):
-            await reload_config_handler(main_app, new_config)
-
-        config_watcher = ConfigWatcher(config_path, reload_callback)
-        config_watcher.start()
-
     logger.info("Uvicorn server starting...")
-    uvicorn_log_level = log_level.lower()
-
     config = uvicorn.Config(
         app=main_app,
         host=host,
         port=port,
         ssl_certfile=ssl_certfile,
         ssl_keyfile=ssl_keyfile,
-        log_level=uvicorn_log_level,
+        log_level="info",
     )
     server = uvicorn.Server(config)
 
-    # Setup signal handlers
-    try:
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(
-                sig, lambda s=sig: shutdown_handler.handle_signal(s)
-            )
-    except NotImplementedError:
-        logger.warning(
-            "loop.add_signal_handler is not available on this platform. Using signal.signal()."
-        )
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, lambda s, f: shutdown_handler.handle_signal(s))
-
-    # Modified server startup
-    try:
-        # Create server task
-        server_task = asyncio.create_task(server.serve())
-        shutdown_handler.track_task(server_task)
-
-        # Wait for either the server to fail or a shutdown signal
-        shutdown_wait_task = asyncio.create_task(shutdown_handler.shutdown_event.wait())
-        done, pending = await asyncio.wait(
-            [server_task, shutdown_wait_task],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        if server_task in done:
-            # Check if the server task raised an exception
-            try:
-                server_task.result()  # This will raise the exception if there was one
-                logger.warning("Server task exited unexpectedly. Initiating shutdown.")
-            except SystemExit as e:
-                logger.error(f"Server failed to start: {e}")
-                raise  # Re-raise SystemExit to maintain proper exit behavior
-            except Exception as e:
-                logger.error(f"Server task failed with exception: {e}")
-                raise
-            shutdown_handler.shutdown_event.set()
-
-        # Cancel the other task
-        for task in pending:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        # Graceful shutdown if server didn't fail with SystemExit
-        logger.info("Initiating server shutdown...")
-        server.should_exit = True
-
-        # Cancel all tracked tasks
-        for task in list(shutdown_handler.tasks):
-            if not task.done():
-                task.cancel()
-
-        # Wait for all tasks to complete
-        if shutdown_handler.tasks:
-            await asyncio.gather(*shutdown_handler.tasks, return_exceptions=True)
-
-    except SystemExit:
-        # Re-raise SystemExit to allow proper program termination
-        logger.info("Server startup failed, exiting...")
-        raise
-    except Exception as e:
-        logger.error(f"Error during server execution: {e}")
-        raise
-    finally:
-        # Stop config watcher if it was started
-        if config_watcher:
-            config_watcher.stop()
-        logger.info("Server shutdown complete")
+    await server.serve()
