@@ -401,6 +401,8 @@ class MCPHotReloader:
                 sub_app.state.server_type = "sse"
                 sub_app.state.args = config["url"]
             
+            sub_app.state.headers = config.get("headers")
+
             # Get API dependency from main app
             api_dependency = getattr(self.app.state, "api_dependency", None)
             sub_app.state.api_dependency = api_dependency
@@ -529,7 +531,11 @@ class MCPHotReloader:
             logger.info(f"🔗 Establishing SSE connection to: {url}")
             
             # Create the SSE client connection
-            sub_app.state._sse_client = sse_client(url=url, sse_read_timeout=None)
+            sub_app.state._sse_client = sse_client(
+                url=url,
+                sse_read_timeout=None,
+                headers=getattr(sub_app.state, "headers", None) or None,
+            )
             sub_app.state._reader, sub_app.state._writer = await sub_app.state._sse_client.__aenter__()
             
             # Create and initialize the session
@@ -591,7 +597,9 @@ class MCPHotReloader:
             logger.info(f"🔗 Establishing streamable HTTP connection to: {url}")
             
             # Create the streamable HTTP client connection
-            sub_app.state._http_client = streamablehttp_client(url=url)
+            sub_app.state._http_client = streamablehttp_client(
+                url=url, headers=getattr(sub_app.state, "headers", None) or None
+            )
             sub_app.state._reader, sub_app.state._writer, _ = await sub_app.state._http_client.__aenter__()
             
             # Create and initialize the session

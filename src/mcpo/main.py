@@ -101,6 +101,7 @@ async def lifespan(app: FastAPI):
 
     args = args if isinstance(args, list) else [args]
     api_dependency = getattr(app.state, "api_dependency", None)
+    headers = getattr(app.state, "headers", None) or None
 
     if (server_type == "stdio" and not command) or (
         server_type == "sse" and not args[0]
@@ -176,7 +177,9 @@ async def lifespan(app: FastAPI):
                     attempt += 1
                     try:
                         logger.info(f"Connecting to SSE endpoint: {args[0]} (attempt {attempt})")
-                        async with sse_client(url=args[0], sse_read_timeout=None) as (
+                        async with sse_client(
+                            url=args[0], sse_read_timeout=None, headers=headers
+                        ) as (
                             reader,
                             writer,
                         ):
@@ -246,7 +249,7 @@ async def lifespan(app: FastAPI):
                 url = f"{url}/"
 
             # Connect using streamablehttp_client from the SDK, similar to sse_client
-            async with streamablehttp_client(url=url) as (
+            async with streamablehttp_client(url=url, headers=headers) as (
                 reader,
                 writer,
                 _,  # get_session_id callback not needed for ClientSession
@@ -445,6 +448,7 @@ def build_app(
                 sub_app.state.server_type = "sse"
                 sub_app.state.args = server_cfg["url"]
 
+            sub_app.state.headers = server_cfg.get("headers")
             sub_app.state.api_dependency = api_dependency
 
             main_app.mount(f"{path_prefix}{server_name}", sub_app)
