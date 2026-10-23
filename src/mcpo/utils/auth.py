@@ -31,7 +31,30 @@ def key_matches(candidate: str, api_key: str) -> bool:
     return hmac.compare_digest(candidate.encode("utf-8"), api_key.encode("utf-8"))
 
 
-def get_verify_api_key(api_key: str):
+def any_key_matches(candidate: str, keys) -> bool:
+    """True when the candidate matches one of the configured keys."""
+    return any(key_matches(candidate, key) for key in keys if key)
+
+
+# Routes only the management key may use; every other path is a mounted
+# MCP server, where the tool key is accepted too.
+MANAGEMENT_PATHS = ("/api/", "/static/", "/docs", "/redoc", "/openapi.json")
+
+
+def is_management_path(path: str) -> bool:
+    return path == "/" or path.startswith(MANAGEMENT_PATHS)
+
+
+def read_key_file(path: str) -> str:
+    """The key stored in a file (surrounding whitespace removed); refuses an empty file."""
+    with open(path, "r", encoding="utf-8") as handle:
+        key = handle.read().strip()
+    if not key:
+        raise ValueError(f"key file {path} is empty")
+    return key
+
+
+def get_verify_api_key(api_key: str, tool_api_key: str | None = None):
     async def verify_api_key(
         authorization: HTTPAuthorizationCredentials = Depends(bearer_security),
     ):
@@ -42,7 +65,7 @@ def get_verify_api_key(api_key: str):
                 headers={"WWW-Authenticate": "Bearer"},
             )
         token = authorization.credentials
-        if not key_matches(token, api_key):
+        if not any_key_matches(token, (api_key, tool_api_key)):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Invalid API key",
@@ -56,9 +79,15 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
     Middleware that enforces Basic or Bearer token authentication for all requests.
     """
 
-    def __init__(self, app, api_key: str):
+    def __init__(self, app, api_key: str, tool_api_key: str | None = None):
         super().__init__(app)
         self.api_key = api_key
+        self.tool_api_key = tool_api_key
+
+    def _keys_for(self, path: str):
+        if is_management_path(path):
+            return (self.api_key,)
+        return (self.api_key, self.tool_api_key)
 
     async def dispatch(self, request: Request, call_next):
         # Skip authentication for OPTIONS requests
@@ -81,7 +110,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             # Handle Bearer token auth
             if authorization.startswith("Bearer "):
                 token = authorization[7:]  # Remove "Bearer " prefix
-                if not key_matches(token, self.api_key):
+                if not any_key_matches(token, self._keys_for(request.url.path)):
                     return JSONResponse(
                         status_code=403, content={"detail": "Invalid API key"}
                     )
@@ -94,7 +123,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                     # Basic auth format is username:password
                     username, password = decoded.split(":", 1)
                     # Any username is allowed, but password must match api_key
-                    if not key_matches(password, self.api_key):
+                    if not any_key_matches(password, self._keys_for(request.url.path)):
                         return JSONResponse(
                             status_code=403, content={"detail": "Invalid credentials"}
                         )

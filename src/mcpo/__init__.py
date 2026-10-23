@@ -7,6 +7,8 @@ from dotenv import dotenv_values
 from typing_extensions import Annotated
 from typing import Optional, List
 
+from mcpo.utils.auth import read_key_file
+
 app = typer.Typer()
 
 
@@ -25,6 +27,17 @@ def main(
     api_key: Annotated[
         Optional[str],
         typer.Option("--api-key", "-k", help="API key for authentication"),
+    ] = None,
+    api_key_file: Annotated[
+        Optional[str],
+        typer.Option("--api-key-file", help="File holding the API key (keeps it out of argv)"),
+    ] = None,
+    tool_api_key_file: Annotated[
+        Optional[str],
+        typer.Option(
+            "--tool-api-key-file",
+            help="File holding a second key that may call tools but not the management APIs",
+        ),
     ] = None,
     strict_auth: Annotated[
         Optional[bool],
@@ -77,6 +90,16 @@ def main(
         Optional[str], typer.Option("--log-level", help="Set log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)")
     ] = None,
 ):
+    tool_api_key = None
+    try:
+        if api_key_file:
+            api_key = read_key_file(api_key_file)
+        if tool_api_key_file:
+            tool_api_key = read_key_file(tool_api_key_file)
+    except (OSError, ValueError) as e:
+        typer.echo(f"Error: {e}")
+        raise typer.Exit(1)
+
     server_command = None
     if not config_path:
         # Find the position of "--"
@@ -138,6 +161,7 @@ def main(
             host,
             port,
             api_key=api_key,
+            tool_api_key=tool_api_key,
             strict_auth=strict_auth,
             cors_allow_origins=cors_allow_origins,
             server_type=server_type,

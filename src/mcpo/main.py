@@ -277,7 +277,9 @@ def build_app(
     **kwargs,
 ) -> FastAPI:
     """Build the mcpo app with its middleware, management APIs and MCP servers."""
-    api_dependency = get_verify_api_key(api_key) if api_key else None
+    # A second key that may call tools but not the management APIs.
+    tool_api_key = kwargs.get("tool_api_key") or None
+    api_dependency = get_verify_api_key(api_key, tool_api_key) if api_key else None
 
     # MCP Server
     server_type = kwargs.get(
@@ -311,7 +313,7 @@ def build_app(
     # The key guards every route, including docs, mounted servers (also those
     # added by hot reload) and the management APIs.
     if api_key:
-        main_app.add_middleware(APIKeyMiddleware, api_key=api_key)
+        main_app.add_middleware(APIKeyMiddleware, api_key=api_key, tool_api_key=tool_api_key)
 
     # Added last so it runs first: preflights and 401s carry CORS headers.
     main_app.add_middleware(CORSMiddleware, **cors_options(cors_allow_origins))
