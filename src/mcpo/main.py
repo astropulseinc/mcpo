@@ -76,6 +76,10 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
             dependencies=[Depends(api_dependency)] if api_dependency else [],
         )(tool_handler)
 
+    # FastAPI caches the OpenAPI document on first request; drop it so a
+    # fetch made before (re)registration doesn't hide these tools.
+    app.openapi_schema = None
+
 
 async def start_server_connection_background(sub_app: FastAPI):
     """Start server connection in background without blocking main app startup"""

@@ -59,3 +59,29 @@ def test_tool_route_calls_the_session():
 
     assert response.status_code == 200
     assert session.calls == [("echo", {"value": "hi"})]
+
+
+def test_openapi_fetched_before_registration_lists_tools_after_it():
+    app = FastAPI()
+    app.state.session = FakeSession([make_tool("echo")])
+    client = TestClient(app)
+
+    before = client.get("/openapi.json").json()["paths"]
+    asyncio.run(create_dynamic_endpoints(app))
+    after = client.get("/openapi.json").json()["paths"]
+
+    assert "/echo" not in before
+    assert "/echo" in after
+
+
+def test_openapi_reflects_a_changed_tool_list():
+    app = FastAPI()
+    client = TestClient(app)
+    app.state.session = FakeSession([make_tool("echo")])
+    asyncio.run(create_dynamic_endpoints(app))
+    client.get("/openapi.json")
+
+    app.state.session = FakeSession([make_tool("echo"), make_tool("shout")])
+    asyncio.run(create_dynamic_endpoints(app))
+
+    assert "/shout" in client.get("/openapi.json").json()["paths"]
