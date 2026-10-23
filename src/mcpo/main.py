@@ -136,7 +136,9 @@ async def lifespan(app: FastAPI):
                         pass
     else:
         if server_type == "stdio":
-            wrapped_command, wrapped_args = stdio_command(command, args)
+            wrapped_command, wrapped_args = stdio_command(
+                command, args, server_id=getattr(app.state, "server_id", "default")
+            )
             server_params = StdioServerParameters(
                 command=wrapped_command,
                 args=wrapped_args,
@@ -427,6 +429,7 @@ def build_app(
                 sub_app.state.command = server_cfg["command"]
                 sub_app.state.args = server_cfg.get("args", [])
                 sub_app.state.env = stdio_environment(server_cfg.get("env"))
+                sub_app.state.server_id = server_name
 
             server_config_type = server_cfg.get("type")
             if server_config_type == "sse" and server_cfg.get("url"):

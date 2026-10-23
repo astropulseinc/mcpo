@@ -25,6 +25,7 @@ except ImportError:
 from .mcp_management import (
     describe_server_config,
     loggable_url,
+    release_stdio_uid,
     stdio_command,
     stdio_environment,
 )
@@ -345,6 +346,7 @@ class MCPHotReloader:
                 await self._cleanup_background_tasks(server_id)
                 
                 del self._sessions[server_id]
+                release_stdio_uid(server_id)
                 logger.info(f"✅ Gracefully stopped MCP server: {server_id}")
         except Exception as e:
             logger.error(f"Failed to stop server {server_id}: {e}")
@@ -392,6 +394,7 @@ class MCPHotReloader:
                 sub_app.state.command = config["command"]
                 sub_app.state.args = config.get("args", [])
                 sub_app.state.env = stdio_environment(config.get("env"))
+                sub_app.state.server_id = server_id
             elif config.get("type") == "sse" and config.get("url"):
                 # SSE server
                 sub_app.state.server_type = "sse"
@@ -570,7 +573,7 @@ class MCPHotReloader:
             
             logger.info(f"🔗 Establishing stdio connection: {command} ({len(args)} args)")
             
-            wrapped_command, wrapped_args = stdio_command(command, args)
+            wrapped_command, wrapped_args = stdio_command(command, args, server_id=server_id)
             server_params = StdioServerParameters(
                 command=wrapped_command,
                 args=wrapped_args,

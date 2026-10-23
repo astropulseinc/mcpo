@@ -210,17 +210,55 @@ def stdio_environment(server_env: dict[str, str] | None) -> dict[str, str]:
     return {**base, **(server_env or {})}
 
 
-def stdio_command(command: str, args: list[str]) -> tuple[str, list[str]]:
+# uid -> server id, for the stdio servers this process has started.
+_STDIO_UIDS: dict[int, str] = {}
+
+
+def stdio_uid(server_id: str) -> int:
+    """The uid a stdio server runs as: fixed per server id, from MCPO_STDIO_UID_POOL ("first:count").
+
+    Two running servers never share a uid; a server whose uid is taken is refused.
+    """
+    import hashlib
+
+    pool = os.environ.get("MCPO_STDIO_UID_POOL", "")
+    try:
+        first, count = (int(part) for part in pool.split(":"))
+    except ValueError:
+        raise ValueError("MCPO_STDIO_UID_POOL must be 'first:count' when MCPO_STDIO_WRAPPER uses {uid}")
+    digest = int(hashlib.sha256(server_id.encode("utf-8")).hexdigest(), 16)
+    uid = first + digest % count
+    holder = _STDIO_UIDS.get(uid)
+    if holder is not None and holder != server_id:
+        raise ValueError(f"stdio uid {uid} for {server_id} is already used by {holder}; rename one server")
+    _STDIO_UIDS[uid] = server_id
+    return uid
+
+
+def release_stdio_uid(server_id: str) -> None:
+    """Free the uid of a stopped stdio server."""
+    for uid, holder in list(_STDIO_UIDS.items()):
+        if holder == server_id:
+            del _STDIO_UIDS[uid]
+
+
+def stdio_command(command: str, args: list[str], server_id: str = "default") -> tuple[str, list[str]]:
     """The command line that starts a stdio server.
 
     MCPO_STDIO_WRAPPER, a JSON list, is put in front of every stdio command,
-    e.g. a launcher that runs the server as a separate unprivileged user.
+    e.g. a launcher that runs each server as its own unprivileged user.
+    "{uid}" in it becomes the server's uid (see stdio_uid) and "{server_id}"
+    the server's id.
     """
     wrapper = json.loads(os.environ.get("MCPO_STDIO_WRAPPER") or "[]")
     if not wrapper:
         return command, list(args)
     if not isinstance(wrapper, list) or not all(isinstance(part, str) for part in wrapper):
         raise ValueError("MCPO_STDIO_WRAPPER must be a JSON list of strings")
+    if any("{uid}" in part for part in wrapper):
+        uid = str(stdio_uid(server_id))
+        wrapper = [part.replace("{uid}", uid) for part in wrapper]
+    wrapper = [part.replace("{server_id}", server_id) for part in wrapper]
     return wrapper[0], [*wrapper[1:], command, *args]
 
 

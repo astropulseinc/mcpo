@@ -1,6 +1,7 @@
 import asyncio
 import json
 
+import pytest
 from fastapi import FastAPI
 
 from mcpo import mcp_management
@@ -123,3 +124,52 @@ def test_hot_added_stdio_servers_run_through_the_wrapper(tmp_path, monkeypatch):
 
     assert seen[0].command == WRAPPER[0]
     assert seen[0].args == WRAPPER[1:] + ["npx", "-y", "pkg"]
+
+
+POOL_WRAPPER = ["/usr/local/sbin/run-as-tools", "--reuid={uid}", "--", "/usr/bin/env", "HOME=/var/lib/nova-tools/{uid}"]
+
+
+@pytest.fixture
+def uid_pool(monkeypatch):
+    monkeypatch.setenv("MCPO_STDIO_WRAPPER", json.dumps(POOL_WRAPPER))
+    monkeypatch.setenv("MCPO_STDIO_UID_POOL", "20000:10000")
+    mcp_management.release_stdio_uid("a")
+    mcp_management.release_stdio_uid("b")
+    yield
+    mcp_management.release_stdio_uid("a")
+    mcp_management.release_stdio_uid("b")
+
+
+def test_each_server_gets_its_own_uid_and_home(uid_pool):
+    _, args_a = mcp_management.stdio_command("npx", ["pkg"], server_id="a")
+    _, args_b = mcp_management.stdio_command("npx", ["pkg"], server_id="b")
+
+    uid_a = mcp_management.stdio_uid("a")
+    uid_b = mcp_management.stdio_uid("b")
+    assert uid_a != uid_b
+    assert 20000 <= uid_a < 30000 and 20000 <= uid_b < 30000
+    assert args_a[:4] == [f"--reuid={uid_a}", "--", "/usr/bin/env", f"HOME=/var/lib/nova-tools/{uid_a}"]
+    assert args_b[0] == f"--reuid={uid_b}"
+
+
+def test_a_server_keeps_its_uid_across_restarts(uid_pool):
+    first = mcp_management.stdio_uid("a")
+    mcp_management.release_stdio_uid("a")
+
+    assert mcp_management.stdio_uid("a") == first
+
+
+def test_two_servers_never_share_a_uid(uid_pool, monkeypatch):
+    monkeypatch.setenv("MCPO_STDIO_UID_POOL", "20000:1")
+    mcp_management.stdio_command("npx", ["pkg"], server_id="a")
+
+    with pytest.raises(ValueError, match="uid"):
+        mcp_management.stdio_command("npx", ["pkg"], server_id="b")
+
+
+def test_a_wrapper_with_uid_needs_a_pool(monkeypatch):
+    monkeypatch.setenv("MCPO_STDIO_WRAPPER", json.dumps(POOL_WRAPPER))
+    monkeypatch.delenv("MCPO_STDIO_UID_POOL", raising=False)
+
+    with pytest.raises(ValueError, match="MCPO_STDIO_UID_POOL"):
+        mcp_management.stdio_command("npx", ["pkg"], server_id="a")
