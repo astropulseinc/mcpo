@@ -2,7 +2,7 @@ import sys
 import asyncio
 import typer
 import os
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 from typing_extensions import Annotated
 from typing import Optional, List
@@ -108,9 +108,8 @@ def main(
                 env_dict[key] = value
 
         if env_path:
-            # Load environment variables from the specified file
-            load_dotenv(env_path)
-            env_dict.update(dict(os.environ))
+            # Variables from the file, not the whole proxy environment
+            env_dict.update({k: v for k, v in dotenv_values(env_path).items() if v is not None})
 
         # Set environment variables
         for key, value in env_dict.items():
@@ -153,6 +152,7 @@ def main(
             root_path=root_path,
             headers=headers,
             hot_reload=hot_reload,
+            server_env=env_dict,
         )
     )
 

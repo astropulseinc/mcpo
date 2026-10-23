@@ -51,3 +51,18 @@ def test_hot_added_stdio_servers_do_not_inherit_the_proxy_environment(tmp_path, 
     asyncio.run(reloader._start_server("tool", SERVER))
 
     assert_minimal(seen["env"])
+
+
+def test_cli_stdio_server_gets_only_its_given_environment(monkeypatch):
+    monkeypatch.setenv("NOVA_PROXY_API_KEY", SECRET)
+
+    async def scenario():
+        return build_app(
+            api_key="k",
+            cors_allow_origins=[],
+            server_type="stdio",
+            server_command=["npx", "-y", "pkg"],
+            server_env={"TOKEN": "server-token"},
+        )
+
+    assert_minimal(asyncio.run(scenario()).state.env)

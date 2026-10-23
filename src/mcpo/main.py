@@ -368,7 +368,7 @@ def build_app(
         main_app.state.server_type = "stdio"  # Explicitly set type
         main_app.state.command = server_command[0]
         main_app.state.args = server_command[1:]
-        main_app.state.env = os.environ.copy()
+        main_app.state.env = stdio_environment(kwargs.get("server_env"))
         main_app.state.api_dependency = api_dependency
     elif config_path:
         logger.info(f"Loading MCP server configurations from: {config_path}")
