@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 from mcpo.utils.main import get_model_fields, get_tool_handler
 from mcpo.utils.auth import get_verify_api_key, APIKeyMiddleware
+from mcpo.mcp_management import loggable_url
 
 
 async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
@@ -176,14 +177,14 @@ async def lifespan(app: FastAPI):
                 while True:
                     attempt += 1
                     try:
-                        logger.info(f"Connecting to SSE endpoint: {args[0]} (attempt {attempt})")
+                        logger.info(f"Connecting to SSE endpoint: {loggable_url(args[0])} (attempt {attempt})")
                         async with sse_client(
                             url=args[0], sse_read_timeout=None, headers=headers
                         ) as (
                             reader,
                             writer,
                         ):
-                            logger.info(f"✅ Successfully connected to SSE endpoint: {args[0]}")
+                            logger.info(f"✅ Successfully connected to SSE endpoint: {loggable_url(args[0])}")
                             async with ClientSession(reader, writer) as session:
                                 app.state.session = session
                                 app.state.sse_server_status = "healthy"
@@ -199,7 +200,7 @@ async def lifespan(app: FastAPI):
                                         # Try to list tools to verify connection is alive
                                         await session.list_tools()
                                 except Exception as disconnect_error:
-                                    logger.warning(f"SSE connection lost for {args[0]}: {disconnect_error}")
+                                    logger.warning(f"SSE connection lost for {loggable_url(args[0])}: {disconnect_error}")
                                     app.state.sse_server_status = "unhealthy"
                                     app.state.session = None
                                     
@@ -208,12 +209,12 @@ async def lifespan(app: FastAPI):
                                     
                     except Exception as e:
                         last_error = str(e)
-                        logger.warning(f"❌ Failed to connect to SSE endpoint {args[0]} (attempt {attempt}): {e}")
+                        logger.warning(f"❌ Failed to connect to SSE endpoint {loggable_url(args[0])} (attempt {attempt}): {e}")
                         app.state.sse_last_error = last_error
                         
                         # Stop retrying for permanent errors
                         if is_permanent_error(last_error):
-                            logger.error(f"🚫 Permanent error detected for {args[0]}. Stopping retries: {e}")
+                            logger.error(f"🚫 Permanent error detected for {loggable_url(args[0])}. Stopping retries: {e}")
                             app.state.sse_server_status = "error"
                             return
                         
@@ -348,14 +349,14 @@ def build_app(
 
     if server_type == "sse":
         logger.info(
-            f"Configuring for a single SSE MCP Server with URL {server_command[0]}"
+            f"Configuring for a single SSE MCP Server with URL {loggable_url(server_command[0])}"
         )
         main_app.state.server_type = "sse"
         main_app.state.args = server_command[0]  # Expects URL as the first element
         main_app.state.api_dependency = api_dependency
     elif server_type == "streamablehttp" or server_type == "streamable_http":
         logger.info(
-            f"Configuring for a single StreamableHTTP MCP Server with URL {server_command[0]}"
+            f"Configuring for a single StreamableHTTP MCP Server with URL {loggable_url(server_command[0])}"
         )
         main_app.state.server_type = "streamablehttp"
         main_app.state.args = server_command[0]  # Expects URL as the first element
@@ -391,18 +392,18 @@ def build_app(
                 "url"
             ):
                 logger.info(
-                    f"  Configuring SSE MCP Server '{server_name_cfg}' with URL: {server_cfg_details['url']}"
+                    f"  Configuring SSE MCP Server '{server_name_cfg}' with URL: {loggable_url(server_cfg_details['url'])}"
                 )
             elif (
                 server_cfg_details.get("type") == "streamablehttp"
                 or server_cfg_details.get("type") == "streamable_http"
             ) and server_cfg_details.get("url"):
                 logger.info(
-                    f"  Configuring StreamableHTTP MCP Server '{server_name_cfg}' with URL: {server_cfg_details['url']}"
+                    f"  Configuring StreamableHTTP MCP Server '{server_name_cfg}' with URL: {loggable_url(server_cfg_details['url'])}"
                 )
             elif server_cfg_details.get("url"):  # Fallback for old SSE config
                 logger.info(
-                    f"  Configuring SSE (fallback) MCP Server '{server_name_cfg}' with URL: {server_cfg_details['url']}"
+                    f"  Configuring SSE (fallback) MCP Server '{server_name_cfg}' with URL: {loggable_url(server_cfg_details['url'])}"
                 )
             else:
                 logger.warning(

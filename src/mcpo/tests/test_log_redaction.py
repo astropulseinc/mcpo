@@ -1,6 +1,9 @@
 import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
+
+import mcpo.main
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -70,4 +73,29 @@ def test_startup_logs_config_servers_without_args(tmp_path, monkeypatch, caplog)
 
     asyncio.run(scenario())
     assert "files" in caplog.text
+    assert SECRET not in caplog.text
+
+
+def test_server_urls_are_logged_without_credentials_or_query(tmp_path, monkeypatch, caplog):
+    url = f"http://user:{SECRET}@backend:8080/sse?token={SECRET}"
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"mcpServers": {"events": {"type": "sse", "url": url}}}))
+    monkeypatch.setattr(mcp_management, "CONFIG_PATH", str(path))
+
+    @asynccontextmanager
+    async def refuse(*_args, **_kwargs):
+        raise RuntimeError("no connection in tests")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(mcpo.main, "sse_client", refuse)
+
+    async def scenario():
+        with caplog.at_level(logging.DEBUG):
+            app = build_app(api_key="k", cors_allow_origins=[], config_path=str(path))
+            sub = next(r.app for r in app.routes if getattr(r, "path", "") == "/events")
+            async with sub.router.lifespan_context(sub):
+                await asyncio.sleep(0.05)
+
+    asyncio.run(scenario())
+    assert "backend:8080/sse" in caplog.text
     assert SECRET not in caplog.text

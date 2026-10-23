@@ -22,7 +22,7 @@ except ImportError:
     FileSystemEventHandler = None
     FileModifiedEvent = None
 
-from .mcp_management import describe_server_config
+from .mcp_management import describe_server_config, loggable_url
 
 logger = logging.getLogger(__name__)
 
@@ -530,7 +530,7 @@ class MCPHotReloader:
             if not url:
                 raise Exception(f"No SSE URL configured for server {server_id}")
             
-            logger.info(f"🔗 Establishing SSE connection to: {url}")
+            logger.info(f"🔗 Establishing SSE connection to: {loggable_url(url)}")
             
             # Create the SSE client connection
             sub_app.state._sse_client = sse_client(
@@ -596,7 +596,7 @@ class MCPHotReloader:
             if not url:
                 raise Exception(f"No HTTP URL configured for server {server_id}")
             
-            logger.info(f"🔗 Establishing streamable HTTP connection to: {url}")
+            logger.info(f"🔗 Establishing streamable HTTP connection to: {loggable_url(url)}")
             
             # Create the streamable HTTP client connection
             sub_app.state._http_client = streamablehttp_client(

@@ -161,17 +161,26 @@ def redact_secrets(value: Any) -> Any:
     return value
 
 
-def describe_server_config(config: dict[str, Any]) -> dict[str, Any]:
-    """A loggable summary of a server config: no args, env or header values."""
+def loggable_url(url: Any) -> str:
+    """A URL without user info, query or fragment, safe to log."""
     from urllib.parse import urlsplit
 
+    try:
+        parts = urlsplit(str(url))
+        port = f":{parts.port}" if parts.port else ""
+        return f"{parts.scheme}://{parts.hostname or ''}{port}{parts.path}"
+    except ValueError:
+        return "<invalid url>"
+
+
+def describe_server_config(config: dict[str, Any]) -> dict[str, Any]:
+    """A loggable summary of a server config: no args, env or header values."""
     summary: dict[str, Any] = {"type": config.get("type")}
     if config.get("command"):
         summary["command"] = config["command"]
         summary["args"] = len(config.get("args") or [])
     if config.get("url"):
-        parts = urlsplit(str(config["url"]))
-        summary["url"] = f"{parts.scheme}://{parts.hostname or ''}{f':{parts.port}' if parts.port else ''}{parts.path}"
+        summary["url"] = loggable_url(config["url"])
     for field in _SECRET_FIELDS:
         if isinstance(config.get(field), dict):
             summary[field] = sorted(config[field])
