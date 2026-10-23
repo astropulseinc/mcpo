@@ -977,7 +977,11 @@ def apply_monkey_patch(app):
         """Remove MCP server"""
         result = remove_mcp_server(server_id)
         if result["success"]:
-            # A server added later under this id starts with a fresh home.
+            # Stop the process first, then retire its uid: a server added
+            # later under this id starts with a fresh home.
+            reloader = getattr(app.state, "hot_reloader", None)
+            if reloader:
+                await reloader.stop_server(server_id)
             retire_stdio_uid(server_id)
             return {"message": result["message"]}
         else:

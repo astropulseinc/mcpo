@@ -346,8 +346,20 @@ class MCPHotReloader:
                 
                 del self._sessions[server_id]
                 logger.info(f"✅ Gracefully stopped MCP server: {server_id}")
+            elif server_id in getattr(self.app.state, "server_tasks", {}):
+                # A server started with the app (from config.json at boot):
+                # its connection task owns the process.
+                self._unmount_server(server_id)
+                await self._cleanup_background_tasks(server_id)
+                logger.info(f"✅ Stopped MCP server started at boot: {server_id}")
         except Exception as e:
             logger.error(f"Failed to stop server {server_id}: {e}")
+
+    async def stop_server(self, server_id: str):
+        """Stop a server now, whether it started at boot or by hot reload."""
+        await self._stop_server(server_id)
+        if self.current_config:
+            self.current_config.get("mcpServers", {}).pop(server_id, None)
     
     def _unmount_server(self, server_id: str):
         """Unmount a server from FastAPI routes"""
@@ -518,6 +530,8 @@ class MCPHotReloader:
             if not hasattr(self.app.state, 'connection_tasks'):
                 self.app.state.connection_tasks = []
             self.app.state.connection_tasks.append(task)
+            from .main import register_server_task
+            register_server_task(self.app, server_id, task)
             
             logger.info(f"✅ Started maintenance task for server: {server_id}")
             
@@ -632,6 +646,8 @@ class MCPHotReloader:
             if not hasattr(self.app.state, 'connection_tasks'):
                 self.app.state.connection_tasks = []
             self.app.state.connection_tasks.append(task)
+            from .main import register_server_task
+            register_server_task(self.app, server_id, task)
             
             logger.info(f"✅ Started background connection task for server: {server_id}")
             
@@ -682,28 +698,20 @@ class MCPHotReloader:
             sub_app.state.connection_status = "failed"
     
     async def _cleanup_background_tasks(self, server_id: str):
-        """Clean up background connection tasks for a server"""
+        """Cancel this server's connection tasks (and so stop its process), and only its own."""
         try:
-            if hasattr(self.app.state, 'connection_tasks'):
-                # Note: In a more sophisticated implementation, we'd track tasks per server
-                # For now, we'll just ensure all tasks are properly managed
-                tasks_to_cancel = []
-                for task in self.app.state.connection_tasks:
-                    if not task.done():
-                        tasks_to_cancel.append(task)
-                
-                # Cancel tasks
-                for task in tasks_to_cancel:
-                    task.cancel()
-                
-                # Wait for cancellation to complete
-                if tasks_to_cancel:
-                    await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
-                
-                logger.info(f"✅ Cleaned up {len(tasks_to_cancel)} background tasks for server: {server_id}")
+            tasks = getattr(self.app.state, "server_tasks", {}).pop(server_id, [])
+            pending = [task for task in tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if hasattr(self.app.state, "connection_tasks"):
+                self.app.state.connection_tasks = [t for t in self.app.state.connection_tasks if t not in tasks]
+            logger.info(f"✅ Cleaned up {len(pending)} background tasks for server: {server_id}")
         except Exception as e:
             logger.error(f"❌ Failed to cleanup background tasks for {server_id}: {e}")
-    
+
     async def _verify_tools_or_force_reload(self, server_id: str, sub_app):
         """Verify tools are available or trigger force reload"""
         try:

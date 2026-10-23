@@ -92,6 +92,13 @@ async def start_server_connection_background(sub_app: FastAPI):
         sub_app.state.connection_status = "failed"
 
 
+def register_server_task(app: FastAPI, server_id: str, task: "asyncio.Task") -> None:
+    """Record a task that keeps a server's connection (and process) alive, by server id."""
+    if not hasattr(app.state, "server_tasks"):
+        app.state.server_tasks = {}
+    app.state.server_tasks.setdefault(server_id, []).append(task)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     server_type = getattr(app.state, "server_type", "stdio")
@@ -119,6 +126,8 @@ async def lifespan(app: FastAPI):
                     start_server_connection_background(route.app)
                 )
                 connection_tasks.append(task)
+                server_id = getattr(route.app.state, "server_id", route.path.lstrip("/"))
+                register_server_task(app, server_id, task)
         
         # Store tasks for cleanup later
         app.state.connection_tasks = connection_tasks
@@ -429,7 +438,6 @@ def build_app(
                 sub_app.state.command = server_cfg["command"]
                 sub_app.state.args = server_cfg.get("args", [])
                 sub_app.state.env = stdio_environment(server_cfg.get("env"))
-                sub_app.state.server_id = server_name
 
             server_config_type = server_cfg.get("type")
             if server_config_type == "sse" and server_cfg.get("url"):
@@ -452,6 +460,7 @@ def build_app(
                 sub_app.state.args = server_cfg["url"]
 
             sub_app.state.headers = server_cfg.get("headers")
+            sub_app.state.server_id = server_name
             sub_app.state.api_dependency = api_dependency
 
             main_app.mount(f"{path_prefix}{server_name}", sub_app)
