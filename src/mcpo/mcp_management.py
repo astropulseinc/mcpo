@@ -548,7 +548,14 @@ def reload_individual_server(server_id: str, app=None) -> Dict[str, Any]:
             return {"success": False, "error": f"Server {server_id} not found"}
         
         server_config = server_result["server"]
-        
+
+        # Re-adding validates the config, so check first: a stored config that
+        # no longer passes must not be removed and then refused.
+        error = validate_server_config(server_id, server_config)
+        if error:
+            logger.warning(f"Not reloading {server_id}: {error}")
+            return {"success": False, "error": f"Server {server_id} cannot be reloaded: {error}"}
+
         # For now, use the simpler fallback approach for individual server reload
         # The hot reload async context is complex and better suited for full system reloads
         logger.info(f"🔄 Reloading server {server_id} via config update (bypasses exponential backoff)")

@@ -295,3 +295,15 @@ def test_hot_added_servers_do_not_widen_cors(stores, monkeypatch):
 
     assert response.status_code == 200
     assert "access-control-allow-origin" not in response.headers
+
+
+def test_reloading_a_server_that_no_longer_validates_keeps_it(stores):
+    stored = {"type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-memory-old"]}
+    config = json.loads(stores.read_text())
+    config["mcpServers"]["memory"] = stored
+    stores.write_text(json.dumps(config))
+
+    response = management_app().post("/api/mcp/servers/memory/reload")
+
+    assert response.status_code >= 400
+    assert json.loads(stores.read_text())["mcpServers"]["memory"] == stored
