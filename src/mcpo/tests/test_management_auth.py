@@ -37,7 +37,7 @@ TEMPLATES = {
             "args": ["-y", "@modelcontextprotocol/server-filesystem", "{{PATHS}}"],
             "env": {},
         },
-        "user_configurable": {"PATHS": {"type": "path_list"}},
+        "user_configurable": {"PATHS": {"type": "path_list", "validation": {"allowed_roots": ["/data"]}}},
     },
 }
 
@@ -357,3 +357,22 @@ def test_reload_is_a_reserved_server_id(stores):
 
     assert "reload" not in json.loads(stores.read_text())["mcpServers"]
     assert response.status_code != 200 or "added" not in response.text
+
+
+@pytest.mark.parametrize("path", ["/", "/etc", "/data/../etc", "data/a", "/database", "/opt/nova"])
+def test_filesystem_paths_outside_the_allowed_roots_are_refused(stores, path):
+    response = management_app().post(
+        "/api/mcp/servers/files",
+        json={"type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", path]},
+    )
+
+    assert response.status_code == 400
+
+
+def test_filesystem_paths_under_the_allowed_roots_are_accepted(stores):
+    response = management_app().post(
+        "/api/mcp/servers/files",
+        json={"type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data", "/data/x/y"]},
+    )
+
+    assert response.status_code == 200

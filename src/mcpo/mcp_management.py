@@ -107,14 +107,47 @@ def _is_placeholder(arg: Any) -> bool:
     return isinstance(arg, str) and bool(_PLACEHOLDER_PATTERN.match(arg))
 
 
-def _args_match(template_args: list[Any], args: list[Any]) -> bool:
-    """Literal template args must appear in order; a {{placeholder}} takes one or more args."""
+def _bind_args(template_args: list[Any], args: list[Any]) -> dict[str, list[Any]] | None:
+    """Match args to a template: literals in order, a {{placeholder}} takes one or more.
+
+    Returns the args each placeholder took, or None when they don't match.
+    """
     if not template_args:
-        return not args
+        return {} if not args else None
     head, rest = template_args[0], template_args[1:]
     if _is_placeholder(head):
-        return any(_args_match(rest, args[n:]) for n in range(1, len(args) + 1))
-    return bool(args) and args[0] == head and _args_match(rest, args[1:])
+        for n in range(1, len(args) + 1):
+            bound = _bind_args(rest, args[n:])
+            if bound is not None:
+                return {head[2:-2]: list(args[:n]), **bound}
+        return None
+    if args and args[0] == head:
+        return _bind_args(rest, args[1:])
+    return None
+
+
+def _path_allowed(value: Any, roots: list[str]) -> bool:
+    """An absolute, normalized path inside one of the roots (never / itself)."""
+    if not isinstance(value, str) or not value.startswith("/"):
+        return False
+    if os.path.normpath(value) != value or value == "/":
+        return False
+    return any(value == root or value.startswith(root.rstrip("/") + "/") for root in roots)
+
+
+def _bound_values_allowed(template: dict[str, Any], bound: dict[str, list[Any]]) -> bool:
+    """Bound path_list values must sit under the field's allowed_roots, if it names any."""
+    fields = template.get("user_configurable") or {}
+    for name, values in bound.items():
+        field = fields.get(name) or {}
+        roots = (field.get("validation") or {}).get("allowed_roots")
+        if (
+            field.get("type") == "path_list"
+            and roots is not None
+            and not all(_path_allowed(value, roots) for value in values)
+        ):
+            return False
+    return True
 
 
 def find_verified_template(config: dict[str, Any], templates: dict[str, Any]) -> str | None:
@@ -126,7 +159,8 @@ def find_verified_template(config: dict[str, Any], templates: dict[str, Any]) ->
         template_config = (template or {}).get("config_template") or {}
         if not template_config.get("command") or template_config["command"] != command:
             continue
-        if not _args_match(template_config.get("args") or [], args):
+        bound = _bind_args(template_config.get("args") or [], args)
+        if bound is None or not _bound_values_allowed(template, bound):
             continue
         if env_keys <= set((template_config.get("env") or {}).keys()):
             return template_id
