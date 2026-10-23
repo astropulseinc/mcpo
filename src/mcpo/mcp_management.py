@@ -7,6 +7,7 @@ Adds dynamic MCP server management capabilities to mcpo
 import json
 import os
 import logging
+import re
 import time
 from typing import Dict, Any, List
 from pathlib import Path
@@ -21,6 +22,8 @@ except ImportError:
     logger.warning("PyYAML not available, will use JSON fallback for templates")
 
 import tempfile
+INTERNAL_ERROR = "Internal error; see the nova-proxy logs"
+
 CONFIG_PATH = os.environ.get("NOVA_CONFIG_PATH", "/opt/nova/config.json")
 MARKETPLACE_CONFIG_PATH = os.environ.get("NOVA_MARKETPLACE_CONFIG_PATH", "/opt/nova/marketplace_servers.json")
 MARKETPLACE_TEMPLATES_PATH = os.environ.get("NOVA_MARKETPLACE_TEMPLATES_PATH", "../../nova-proxy/marketplace-templates.yaml")
@@ -94,12 +97,399 @@ def load_marketplace_templates() -> Dict[str, Any]:
         logger.error(f"Failed to load marketplace templates: {e}")
         return {}
 
+
+RESERVED_SERVER_IDS = {"reload", "api", "static", "docs", "redoc", "openapi.json"}
+SERVER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_PLACEHOLDER_PATTERN = re.compile(r"^\{\{[A-Za-z0-9_]+\}\}$")
+
+
+def _is_placeholder(arg: Any) -> bool:
+    return isinstance(arg, str) and bool(_PLACEHOLDER_PATTERN.match(arg))
+
+
+def _bind_args(template_args: list[Any], args: list[Any]) -> dict[str, list[Any]] | None:
+    """Match args to a template: literals in order, a {{placeholder}} takes one or more.
+
+    Returns the args each placeholder took, or None when they don't match.
+    """
+    if not template_args:
+        return {} if not args else None
+    head, rest = template_args[0], template_args[1:]
+    if _is_placeholder(head):
+        for n in range(1, len(args) + 1):
+            bound = _bind_args(rest, args[n:])
+            if bound is not None:
+                return {head[2:-2]: list(args[:n]), **bound}
+        return None
+    if args and args[0] == head:
+        return _bind_args(rest, args[1:])
+    return None
+
+
+def _path_allowed(value: Any, roots: list[str]) -> bool:
+    """An absolute, normalized path inside one of the roots (never / itself)."""
+    if not isinstance(value, str) or not value.startswith("/"):
+        return False
+    if os.path.normpath(value) != value or value == "/":
+        return False
+    return any(value == root or value.startswith(root.rstrip("/") + "/") for root in roots)
+
+
+def _bound_values_allowed(template: dict[str, Any], bound: dict[str, list[Any]]) -> bool:
+    """Bound path_list values must sit under the field's allowed_roots, if it names any."""
+    fields = template.get("user_configurable") or {}
+    for name, values in bound.items():
+        field = fields.get(name) or {}
+        roots = (field.get("validation") or {}).get("allowed_roots")
+        if (
+            field.get("type") == "path_list"
+            and roots is not None
+            and not all(_path_allowed(value, roots) for value in values)
+        ):
+            return False
+    return True
+
+
+def find_verified_template(config: dict[str, Any], templates: dict[str, Any]) -> str | None:
+    """Return the id of the verified template whose command this config runs, if any."""
+    command = config.get("command")
+    args = config.get("args") or []
+    env_keys = set((config.get("env") or {}).keys())
+    for template_id, template in templates.items():
+        template_config = (template or {}).get("config_template") or {}
+        if not template_config.get("command") or template_config["command"] != command:
+            continue
+        bound = _bind_args(template_config.get("args") or [], args)
+        if bound is None or not _bound_values_allowed(template, bound):
+            continue
+        if env_keys <= set((template_config.get("env") or {}).keys()):
+            return template_id
+    return None
+
+
+def validate_server_config(server_id: str, config: dict[str, Any]) -> str | None:
+    """Return why a server config may not be stored, or None when it may."""
+    if not SERVER_ID_PATTERN.match(server_id or ""):
+        return "Server id may contain only letters, digits, '-' and '_' (at most 64)"
+    if server_id in RESERVED_SERVER_IDS:
+        return f"Server id '{server_id}' is reserved"
+    if config.get("command") and find_verified_template(config, load_marketplace_templates()) is None:
+        return "A command server must match a verified marketplace template (command, arguments and environment keys)"
+    return None
+
+
+SECRET_MASK = "***HIDDEN***"
+_SECRET_FIELDS = ("env", "headers")
+
+
+def redact_secrets(value: Any) -> Any:
+    """Copy of a config (at any depth) with every env and header value masked."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                {name: SECRET_MASK for name in item}
+                if key in _SECRET_FIELDS and isinstance(item, dict)
+                else redact_secrets(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_secrets(item) for item in value]
+    return value
+
+
+# The only proxy variables a stdio server inherits; secrets in the proxy's
+# environment (its API key, the AstroPulse key, LLM keys) stay out of
+# third-party processes.
+_STDIO_BASE_ENV = ("PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "TZ")
+
+
+def stdio_environment(server_env: dict[str, str] | None) -> dict[str, str]:
+    """Environment for a stdio server: a minimal base plus its own config env."""
+    base = {key: os.environ[key] for key in _STDIO_BASE_ENV if key in os.environ}
+    return {**base, **(server_env or {})}
+
+
+# Server id -> uid assignments, kept in memory when MCPO_STDIO_UID_MAP is unset.
+_MEMORY_UID_MAP: dict[str, Any] = {"assigned": {}, "retired": []}
+
+
+def _uid_hash(server_id: str) -> int:
+    import hashlib
+
+    return int(hashlib.sha256(server_id.encode("utf-8")).hexdigest(), 16)
+
+
+def _uid_pool() -> tuple[int, int]:
+    pool = os.environ.get("MCPO_STDIO_UID_POOL", "")
+    try:
+        first, count = (int(part) for part in pool.split(":"))
+    except ValueError:
+        raise ValueError("MCPO_STDIO_UID_POOL must be 'first:count' when MCPO_STDIO_WRAPPER uses {uid}")
+    return first, count
+
+
+def _load_uid_map() -> dict[str, Any]:
+    path = os.environ.get("MCPO_STDIO_UID_MAP")
+    if not path:
+        return _MEMORY_UID_MAP
+    if not os.path.exists(path):
+        return {"assigned": {}, "retired": []}
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    data.setdefault("assigned", {})
+    data.setdefault("retired", [])
+    return data
+
+
+def _save_uid_map(data: dict[str, Any]) -> None:
+    """Write the map crash-safely: a unique owner-only temp file, synced, then renamed."""
+    path = os.environ.get("MCPO_STDIO_UID_MAP")
+    if not path:
+        return
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".stdio_uids.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _home_marker(uid: int) -> tuple[str, str] | None:
+    """(server id, package) from the launcher's <uid>.owner marker, if the uid was ever used."""
+    base = os.environ.get("MCPO_STDIO_HOME_BASE")
+    if not base:
+        return None
+    try:
+        with open(os.path.join(base, f"{uid}.owner"), "r", encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except FileNotFoundError:
+        return None
+    return (lines[0] if lines else "", lines[1] if len(lines) > 1 else "")
+
+
+def stdio_package(command: str, args: list[str]) -> str:
+    """What a stdio server runs: its command and first non-flag argument (the npx package)."""
+    package = next((arg for arg in args if not str(arg).startswith("-")), "")
+    return f"{command} {package}".strip()
+
+
+def stdio_uid(server_id: str, package: str | None = None) -> int:
+    """The uid a stdio server runs as, from MCPO_STDIO_UID_POOL ("first:count").
+
+    An id keeps its uid (persisted in MCPO_STDIO_UID_MAP, owner-only), and no
+    other id ever gets it: a taken uid is skipped by probing to the next free
+    one, and the uid of a removed server is retired, never reassigned. An id
+    whose package changed gets a fresh uid (and so a fresh home). The
+    launcher's home markers (MCPO_STDIO_HOME_BASE) also count: a uid whose
+    marker names another server or package is never handed out, even if
+    the map was lost.
+    """
+    first, count = _uid_pool()
+    data = _load_uid_map()
+    assigned, retired = data["assigned"], data["retired"]
+    entry = assigned.get(server_id)
+    if entry and package and entry.get("package") and entry["package"] != package:
+        retired.append(entry["uid"])
+        del assigned[server_id]
+        entry = None
+    if entry:
+        uid = entry["uid"]
+        if package and not entry.get("package"):
+            entry["package"] = package
+    else:
+        taken = {item["uid"] for item in assigned.values()} | set(retired)
+        start = _uid_hash(server_id) % count
+
+        def free(candidate: int) -> bool:
+            if candidate in taken:
+                return False
+            marker = _home_marker(candidate)
+            return marker is None or marker == (server_id, package or "")
+
+        uid = next(
+            (first + (start + step) % count for step in range(count) if free(first + (start + step) % count)),
+            None,
+        )
+        if uid is None:
+            raise ValueError(
+                f"stdio uid pool {first}:{count} is exhausted; no uid for {server_id}. "
+                "Every uid is assigned or retired. Remove the homes and <uid>.owner markers of servers "
+                "you no longer need under the tool home directory, drop those uids from 'retired' in "
+                "MCPO_STDIO_UID_MAP, or widen MCPO_STDIO_UID_POOL."
+            )
+        assigned[server_id] = {"uid": uid, "package": package}
+    _save_uid_map(data)
+    return uid
+
+
+PROC_ROOT = "/proc"
+
+
+def processes_of_uid(uid: int) -> list[int]:
+    """Pids of live processes whose real uid is uid (from /proc; empty where there is none).
+
+    Zombies don't count: they are dead and hold nothing; their parent (or
+    init) reaps them.
+    """
+    pids = []
+    try:
+        entries = os.listdir(PROC_ROOT)
+    except FileNotFoundError:
+        return pids
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"{PROC_ROOT}/{entry}/status", "r", encoding="utf-8") as handle:
+                fields = dict(line.split(":", 1) for line in handle if ":" in line)
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        state = fields.get("State", "").strip()
+        real_uid = fields.get("Uid", "").split()
+        if real_uid and int(real_uid[0]) == uid and not state.startswith(("Z", "X")):
+            pids.append(int(entry))
+    return pids
+
+
+async def kill_stdio_processes(server_id: str) -> None:
+    """Kill every process of a stdio server's uid, and check none remain.
+
+    The server may ignore stdin EOF and SIGTERM, or leave a setsid child; the
+    proxy can't signal another uid, so MCPO_STDIO_KILL_COMMAND (a JSON list,
+    "{uid}" substituted; e.g. the launcher's --kill-uid) does it as that uid.
+    Raises RuntimeError when processes survive.
+    """
+    import asyncio
+
+    command = json.loads(os.environ.get("MCPO_STDIO_KILL_COMMAND") or "[]")
+    entry = _load_uid_map()["assigned"].get(server_id)
+    if not command or not entry:
+        return
+    uid = entry["uid"]
+    argv = [part.replace("{uid}", str(uid)) for part in command]
+    import subprocess
+
+    try:
+        gone = await asyncio.to_thread(_kill_until_gone, argv, uid)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise RuntimeError(f"killing the processes of server {server_id} (uid {uid}) failed: {e}")
+    if not gone:
+        raise RuntimeError(f"processes of server {server_id} (uid {uid}) survived SIGKILL")
+
+
+def _kill_until_gone(argv: list[str], uid: int, attempts: int = 5) -> bool:
+    """Run the kill command until no process of uid remains; False if some survive."""
+    import subprocess
+
+    for _attempt in range(attempts):
+        subprocess.run(argv, check=False, timeout=10)
+        time.sleep(0.1)
+        if not processes_of_uid(uid):
+            return True
+    return False
+
+
+def retire_stdio_uid(server_id: str) -> None:
+    """A deleted server's uid (and home) is never given to another server."""
+    data = _load_uid_map()
+    entry = data["assigned"].pop(server_id, None)
+    if entry:
+        data["retired"].append(entry["uid"])
+        _save_uid_map(data)
+
+
+def stdio_command(command: str, args: list[str], server_id: str = "default") -> tuple[str, list[str]]:
+    """The command line that starts a stdio server.
+
+    MCPO_STDIO_WRAPPER, a JSON list, is put in front of every stdio command,
+    e.g. a launcher that runs each server as its own unprivileged user.
+    "{uid}" in it becomes the server's uid (see stdio_uid) and "{server_id}"
+    the server's id.
+    """
+    wrapper = json.loads(os.environ.get("MCPO_STDIO_WRAPPER") or "[]")
+    if not wrapper:
+        return command, list(args)
+    if not isinstance(wrapper, list) or not all(isinstance(part, str) for part in wrapper):
+        raise ValueError("MCPO_STDIO_WRAPPER must be a JSON list of strings")
+    if any("{uid}" in part for part in wrapper):
+        uid = str(stdio_uid(server_id, stdio_package(command, args)))
+        wrapper = [part.replace("{uid}", uid) for part in wrapper]
+    package = stdio_package(command, args)
+    wrapper = [part.replace("{server_id}", server_id).replace("{package}", package) for part in wrapper]
+    return wrapper[0], [*wrapper[1:], command, *args]
+
+
+def loggable_url(url: Any) -> str:
+    """A URL without user info, query or fragment, safe to log."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(str(url))
+        port = f":{parts.port}" if parts.port else ""
+        return f"{parts.scheme}://{parts.hostname or ''}{port}{parts.path}"
+    except ValueError:
+        return "<invalid url>"
+
+
+def describe_server_config(config: dict[str, Any]) -> dict[str, Any]:
+    """A loggable summary of a server config: no args, env or header values."""
+    summary: dict[str, Any] = {"type": config.get("type")}
+    if config.get("command"):
+        summary["command"] = config["command"]
+        summary["args"] = len(config.get("args") or [])
+    if config.get("url"):
+        summary["url"] = loggable_url(config["url"])
+    for field in _SECRET_FIELDS:
+        if isinstance(config.get(field), dict):
+            summary[field] = sorted(config[field])
+    return summary
+
+
+def _restore_masked_secrets(config: dict[str, Any], stored: dict[str, Any] | None) -> None:
+    """Put stored values back where a client sent the mask it was shown.
+
+    Stored headers are kept only while the URL is unchanged, so a masked
+    bearer token is never sent to a new destination.
+    """
+    for field in _SECRET_FIELDS:
+        submitted = config.get(field)
+        if not isinstance(submitted, dict):
+            continue
+        previous = (stored or {}).get(field) or {}
+        if field == "headers" and config.get("url") != (stored or {}).get("url"):
+            previous = {}
+        config[field] = {
+            name: (previous[name] if value == SECRET_MASK else value)
+            for name, value in submitted.items()
+            if value != SECRET_MASK or name in previous
+        }
+
+
 def add_mcp_server(server_id: str, config: Dict[str, Any], add_to_marketplace: bool = False) -> Dict[str, Any]:
     """Add a new MCP server dynamically"""
     try:
+        error = validate_server_config(server_id, config)
+        if error:
+            logger.warning(f"Rejected MCP server config for {server_id}: {error}")
+            return {"success": False, "error": error}
+
         # Load current config
         current_config = load_config()
-        
+        _restore_masked_secrets(config, current_config["mcpServers"].get(server_id))
+
         # Add to main config
         current_config["mcpServers"][server_id] = config
         save_config(current_config)
@@ -116,7 +506,7 @@ def add_mcp_server(server_id: str, config: Dict[str, Any], add_to_marketplace: b
         
     except Exception as e:
         logger.error(f"Failed to add MCP server {server_id}: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def remove_mcp_server(server_id: str, force: bool = False) -> Dict[str, Any]:
     """Remove an MCP server"""
@@ -154,7 +544,7 @@ def remove_mcp_server(server_id: str, force: bool = False) -> Dict[str, Any]:
             
     except Exception as e:
         logger.error(f"Failed to remove MCP server {server_id}: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def list_mcp_servers() -> Dict[str, Any]:
     """List all MCP servers"""
@@ -194,7 +584,7 @@ def list_mcp_servers() -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Failed to list MCP servers: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def get_mcp_server(server_id: str) -> Dict[str, Any]:
     """Get specific MCP server configuration"""
@@ -217,7 +607,7 @@ def get_mcp_server(server_id: str) -> Dict[str, Any]:
             
     except Exception as e:
         logger.error(f"Failed to get MCP server {server_id}: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def toggle_mcp_server(server_id: str, enabled: bool) -> Dict[str, Any]:
     """Enable/disable an MCP server"""
@@ -247,45 +637,33 @@ def toggle_mcp_server(server_id: str, enabled: bool) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Failed to toggle MCP server {server_id}: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
-def _test_underlying_connectivity(server_id: str, config: Dict[str, Any]) -> Dict[str, Any]:
-    """Test the underlying connectivity (SSE/command) of an MCP server"""
+def _mounted_app(server_id: str, app=None):
+    """The sub-app mounted for a server, if any."""
+    for route in getattr(app, "routes", []) or []:
+        if getattr(route, "path", None) == f"/{server_id}" and hasattr(route, "app"):
+            return route.app
+    return None
+
+
+def _test_underlying_connectivity(server_id: str, config: Dict[str, Any], app=None) -> Dict[str, Any]:
+    """Check a server without opening new connections to it.
+
+    SSE servers are judged by their live MCP session; command servers by
+    the command being installed.
+    """
     try:
         server_config = config["mcpServers"][server_id]
-        
+
         if server_config.get("type") == "sse" and server_config.get("url"):
-            # Properly test SSE endpoint
-            import httpx
-            try:
-                with httpx.Client(timeout=5.0) as client:
-                    # SSE endpoints should accept text/event-stream
-                    headers = {
-                        "Accept": "text/event-stream",
-                        "Cache-Control": "no-cache"
-                    }
-                    with client.stream("GET", server_config["url"], headers=headers) as response:
-                        # Check status and content-type
-                        if response.status_code >= 400:
-                            return {"success": False, "message": f"SSE endpoint returned {response.status_code}"}
-                        
-                        content_type = response.headers.get("content-type", "")
-                        if "text/event-stream" not in content_type:
-                            return {"success": False, "message": f"SSE endpoint has wrong content-type: {content_type}"}
-                        
-                        # Try to read first event/line to verify it's streaming
-                        for line in response.iter_lines():
-                            if line:  # Got some data, SSE is working
-                                return {"success": True, "message": "SSE endpoint streaming"}
-                            break  # Exit after first line
-                        
-                        return {"success": True, "message": "SSE endpoint responding"}
-                        
-            except httpx.ConnectError as e:
-                return {"success": False, "message": f"SSE connection failed: {str(e)}"}
-            except Exception as e:
-                return {"success": False, "message": f"SSE test error: {str(e)}"}
-        
+            state = getattr(_mounted_app(server_id, app), "state", None)
+            if state is None or not getattr(state, "session", None):
+                return {"success": False, "message": "no live MCP session"}
+            if getattr(state, "connection_status", None) in ("unhealthy", "failed"):
+                return {"success": False, "message": "MCP session is unhealthy"}
+            return {"success": True, "message": "MCP session active"}
+
         elif server_config.get("command"):
             # Test if command exists and is working
             import shutil
@@ -294,11 +672,13 @@ def _test_underlying_connectivity(server_id: str, config: Dict[str, Any]) -> Dic
                 return {"success": True, "message": f"command '{command}' available"}
             else:
                 return {"success": False, "message": f"command '{command}' not found"}
-        
+
         return {"success": True, "message": "no connectivity test needed"}
-        
+
     except Exception as e:
-        return {"success": False, "message": f"connectivity test failed: {str(e)}"}
+        logger.error(f"Connectivity test failed for {server_id}: {e}")
+        return {"success": False, "message": "connectivity test failed"}
+
 
 def _get_mcp_tools_count(server_id: str, app=None) -> Dict[str, Any]:
     """Get actual MCP tools count via tools/list API call"""
@@ -338,8 +718,20 @@ def _get_mcp_tools_count(server_id: str, app=None) -> Dict[str, Any]:
         logger.error(f"Failed to get MCP tools count for {server_id}: {e}")
         return {"count": 0, "method": "error", "error": str(e)}
 
+def _stop_failed(app) -> set:
+    """Servers that were stopped but whose processes survived (see the hot reloader)."""
+    reloader = getattr(getattr(app, "state", None), "hot_reloader", None)
+    return set(getattr(reloader, "stop_failed", set()))
+
+
 def test_mcp_server(server_id: str, app=None) -> Dict[str, Any]:
     """Test if MCP server is actually loaded and working in MCPO"""
+    if server_id in _stop_failed(app):
+        return {
+            "success": False,
+            "message": "Server is stopped (no tools served), but some of its processes survive; retry the delete",
+            "status": "stop_failed",
+        }
     try:
         config = load_config()
         
@@ -364,7 +756,7 @@ def test_mcp_server(server_id: str, app=None) -> Dict[str, Any]:
                             
                             # If we have an active MCP session but count is unknown, show that
                             if mcp_result.get("count") == -1:
-                                connectivity_result = _test_underlying_connectivity(server_id, config)
+                                connectivity_result = _test_underlying_connectivity(server_id, config, app)
                                 return {
                                     "success": True,
                                     "message": f"MCP session active, connectivity OK - {mcp_result.get('message', '')}",
@@ -377,7 +769,7 @@ def test_mcp_server(server_id: str, app=None) -> Dict[str, Any]:
                             if tool_count == 0:
                                 # For SSE servers, check if connectivity is OK even with 0 tools
                                 # This handles the case where SSE connection works but async lifecycle has issues
-                                connectivity_result = _test_underlying_connectivity(server_id, config)
+                                connectivity_result = _test_underlying_connectivity(server_id, config, app)
                                 if connectivity_result["success"] and server_config.get("type") == "sse":
                                     return {
                                         "success": True,
@@ -397,7 +789,7 @@ def test_mcp_server(server_id: str, app=None) -> Dict[str, Any]:
                             
                             # Server is mounted AND has tools - now test underlying connectivity
                             if tool_count > 0:
-                                connectivity_result = _test_underlying_connectivity(server_id, config)
+                                connectivity_result = _test_underlying_connectivity(server_id, config, app)
                                 if connectivity_result["success"]:
                                     return {
                                         "success": True,
@@ -418,7 +810,7 @@ def test_mcp_server(server_id: str, app=None) -> Dict[str, Any]:
             
             if server_mounted:
                 # Server mounted but no tools - test connectivity
-                connectivity_result = _test_underlying_connectivity(server_id, config)
+                connectivity_result = _test_underlying_connectivity(server_id, config, app)
                 if connectivity_result["success"]:
                     return {"success": True, "message": "Server mounted, connectivity OK", "status": "loaded"}
                 else:
@@ -443,7 +835,7 @@ def test_mcp_server(server_id: str, app=None) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Failed to test MCP server {server_id}: {e}")
-        return {"success": False, "message": str(e), "status": "error"}
+        return {"success": False, "message": INTERNAL_ERROR, "status": "error"}
 
 def reload_individual_server(server_id: str, app=None) -> Dict[str, Any]:
     """Reload a specific MCP server (bypass exponential backoff)"""
@@ -454,7 +846,14 @@ def reload_individual_server(server_id: str, app=None) -> Dict[str, Any]:
             return {"success": False, "error": f"Server {server_id} not found"}
         
         server_config = server_result["server"]
-        
+
+        # Re-adding validates the config, so check first: a stored config that
+        # no longer passes must not be removed and then refused.
+        error = validate_server_config(server_id, server_config)
+        if error:
+            logger.warning(f"Not reloading {server_id}: {error}")
+            return {"success": False, "error": f"Server {server_id} cannot be reloaded: {error}"}
+
         # For now, use the simpler fallback approach for individual server reload
         # The hot reload async context is complex and better suited for full system reloads
         logger.info(f"🔄 Reloading server {server_id} via config update (bypasses exponential backoff)")
@@ -492,7 +891,7 @@ def reload_individual_server(server_id: str, app=None) -> Dict[str, Any]:
             
     except Exception as e:
         logger.error(f"Failed to reload individual server {server_id}: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def reload_mcp_servers(app=None, use_hot_reload=True) -> Dict[str, Any]:
     """Reload all MCP servers using hot reload or fallback to restart"""
@@ -567,7 +966,7 @@ def reload_mcp_servers(app=None, use_hot_reload=True) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Failed to reload MCP servers: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def apply_monkey_patch(app):
     """Apply monkey patch to add MCP management endpoints"""
@@ -614,7 +1013,8 @@ def apply_monkey_patch(app):
         command: str = None
         args: List[str] = None
         env: Dict[str, str] = None
-    
+        headers: Dict[str, str] = None
+
     class ServerToggleRequest(BaseModel):
         enabled: bool
     
@@ -624,11 +1024,20 @@ def apply_monkey_patch(app):
         """List all MCP servers"""
         result = list_mcp_servers()
         if result["success"]:
-            return result["servers"]
+            servers = redact_secrets(result["servers"])
+            reloader = getattr(app.state, "hot_reloader", None)
+            tracked = (getattr(reloader, "current_config", None) or {}).get("mcpServers", {})
+            for server_id in _stop_failed(app):
+                if server_id not in servers and server_id in tracked:
+                    # Removed from the config, but its processes outlived the stop.
+                    servers[server_id] = {**redact_secrets(tracked[server_id]), "is_default": False}
+                if server_id in servers:
+                    servers[server_id]["status"] = "stop_failed"
+            return servers
         else:
             raise HTTPException(status_code=500, detail=result["error"])
     
-    @app.get("/api/mcp/servers/reload")
+    @app.post("/api/mcp/servers/reload")
     async def reload_servers(force: bool = Query(False)):
         """Reload all MCP servers. If force=true, kills process (Docker restarts it)"""
         if force:
@@ -656,7 +1065,8 @@ def apply_monkey_patch(app):
                     "method": "process_restart"
                 }
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Force restart failed: {str(e)}")
+                logger.error(f"Force restart failed: {e}")
+                raise HTTPException(status_code=500, detail="Force restart failed")
         else:
             # Normal reload
             result = reload_mcp_servers(app=app, use_hot_reload=True)
@@ -670,7 +1080,7 @@ def apply_monkey_patch(app):
         """Get specific MCP server"""
         result = get_mcp_server(server_id)
         if result["success"]:
-            return result["server"]
+            return redact_secrets(result["server"])
         else:
             raise HTTPException(status_code=404, detail=result["error"])
     
@@ -695,8 +1105,33 @@ def apply_monkey_patch(app):
     @app.delete("/api/mcp/servers/{server_id}")
     async def remove_server(server_id: str):
         """Remove MCP server"""
+        # Stop every process of the server first; only then remove it and
+        # retire its uid, so a server added later under this id starts with
+        # a fresh home.
+        reloader = getattr(app.state, "hot_reloader", None)
+        configured = server_id in load_config().get("mcpServers", {})
+        was_survivor = server_id in _stop_failed(app)
+        if reloader and (configured or was_survivor):
+            try:
+                await reloader.stop_server(server_id)
+            except RuntimeError as e:
+                logger.error(f"Not removing {server_id}: {e}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"Server {server_id} is stopped (no tools served) but some of its processes survive; "
+                        "it was not removed. Retry the delete."
+                    ),
+                )
+        if not configured and was_survivor:
+            # A removed server whose earlier stop failed: now stopped.
+            tracked = (getattr(reloader, "current_config", None) or {}).get("mcpServers", {})
+            tracked.pop(server_id, None)
+            retire_stdio_uid(server_id)
+            return {"message": f"Server {server_id} stopped and removed"}
         result = remove_mcp_server(server_id)
         if result["success"]:
+            retire_stdio_uid(server_id)
             return {"message": result["message"]}
         else:
             raise HTTPException(status_code=404, detail=result["error"])
@@ -731,7 +1166,8 @@ def apply_monkey_patch(app):
                     "method": "process_restart"
                 }
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Force restart failed: {str(e)}")
+                logger.error(f"Force restart failed: {e}")
+                raise HTTPException(status_code=500, detail="Force restart failed")
         else:
             # Normal reload
             result = reload_individual_server(server_id, app=app)
@@ -757,7 +1193,7 @@ def apply_monkey_patch(app):
         if result["success"]:
             return {"message": result["message"], "status": result.get("status", "unknown"), "tool_count": result.get("tool_count"), "success": True}
         else:
-            return {"message": result.get("message", "Unknown error"), "status": "error", "success": False}
+            return {"message": result.get("message", "Unknown error"), "status": "stop_failed" if result.get("status") == "stop_failed" else "error", "success": False}
     
     @app.get("/api/mcp/servers/{server_id}/health")
     async def get_server_health(server_id: str):
@@ -766,7 +1202,7 @@ def apply_monkey_patch(app):
         if result["success"]:
             return {"status": result.get("status", "unknown"), "message": result["message"], "tool_count": result.get("tool_count")}
         else:
-            return {"status": "error", "message": result.get("message", "Unknown error")}
+            return {"status": "stop_failed" if result.get("status") == "stop_failed" else "error", "message": result.get("message", "Unknown error")}
     
     # Marketplace endpoints (API-driven implementation)
     @app.get("/api/marketplace/templates")
@@ -782,8 +1218,7 @@ def apply_monkey_patch(app):
     @app.get("/api/marketplace/custom")
     async def get_custom_servers():
         """Get user's custom servers (non-verified)"""
-        custom_servers = load_marketplace_servers()
-        return custom_servers
+        return redact_secrets(load_marketplace_servers())
     
     @app.get("/api/marketplace/servers")
     async def get_marketplace_servers(category: str = Query(None)):
@@ -805,7 +1240,7 @@ def apply_monkey_patch(app):
             all_servers[server_id] = template_copy
         
         # Add custom servers (mark as unverified)
-        for server_id, custom in custom_servers.items():
+        for server_id, custom in redact_secrets(custom_servers).items():
             custom_copy = custom.copy()
             custom_copy["verified"] = False
             custom_copy["source"] = "custom"
@@ -934,7 +1369,7 @@ def apply_monkey_patch(app):
     @app.get("/api/marketplace/servers/{server_id}")
     async def get_marketplace_server(server_id: str):
         """Get marketplace server details"""
-        marketplace_servers = await get_marketplace_servers()
+        marketplace_servers = await get_marketplace_servers(category=None)
         if server_id in marketplace_servers:
             return marketplace_servers[server_id]
         else:
@@ -1062,6 +1497,11 @@ def apply_monkey_patch(app):
                 config["env"] = {}
             config["env"].update(install_request.environment_vars)
         
+        error = validate_server_config(server_id, config)
+        if error:
+            logger.warning(f"Rejected marketplace install of {server_id}: {error}")
+            raise HTTPException(status_code=400, detail=error)
+
         # Validate required environment variables exist
         if required_vars:
             from mcpo.environment_management import list_environment_variables
@@ -1118,7 +1558,10 @@ def apply_monkey_patch(app):
         
         # Get server config
         server_config = current_config["mcpServers"][server_id]
-        
+        error = validate_server_config(server_id, server_config)
+        if error:
+            raise HTTPException(status_code=400, detail=error)
+
         # Add to marketplace
         marketplace_servers = load_marketplace_servers()
         marketplace_servers[server_id] = {
@@ -1173,7 +1616,7 @@ def apply_monkey_patch(app):
                 "in_marketplace": True,
                 "type": "custom",
                 "can_modify": True,
-                "details": marketplace_servers[server_id]
+                "details": redact_secrets(marketplace_servers[server_id])
             }
         else:
             return {
@@ -1247,7 +1690,8 @@ def apply_monkey_patch(app):
                     }
                 }
         except Exception as e:
-            return {"error": f"Failed to generate OpenAPI schema: {str(e)}"}
+            logger.error(f"Failed to generate OpenAPI schema: {e}")
+            return {"error": "Failed to generate OpenAPI schema"}
     
     # Add API documentation endpoint
     @app.get("/docs", response_class=HTMLResponse)

@@ -2,10 +2,12 @@ import sys
 import asyncio
 import typer
 import os
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 from typing_extensions import Annotated
 from typing import Optional, List
+
+from mcpo.utils.auth import read_key_file
 
 app = typer.Typer()
 
@@ -26,10 +28,22 @@ def main(
         Optional[str],
         typer.Option("--api-key", "-k", help="API key for authentication"),
     ] = None,
+    api_key_file: Annotated[
+        Optional[str],
+        typer.Option("--api-key-file", help="File holding the API key (keeps it out of argv)"),
+    ] = None,
+    tool_api_key_file: Annotated[
+        Optional[str],
+        typer.Option(
+            "--tool-api-key-file",
+            help="File holding a second key that may call tools but not the management APIs",
+        ),
+    ] = None,
     strict_auth: Annotated[
         Optional[bool],
         typer.Option(
-            "--strict-auth", help="API key protects all endpoints and documentation"
+            "--strict-auth",
+            help="Kept for compatibility: the API key always protects every endpoint",
         ),
     ] = False,
     env: Annotated[
@@ -76,6 +90,16 @@ def main(
         Optional[str], typer.Option("--log-level", help="Set log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)")
     ] = None,
 ):
+    tool_api_key = None
+    try:
+        if api_key_file:
+            api_key = read_key_file(api_key_file)
+        if tool_api_key_file:
+            tool_api_key = read_key_file(tool_api_key_file)
+    except (OSError, ValueError) as e:
+        typer.echo(f"Error: {e}")
+        raise typer.Exit(1)
+
     server_command = None
     if not config_path:
         # Find the position of "--"
@@ -96,7 +120,7 @@ def main(
         print("Starting MCP OpenAPI Proxy with config file:", config_path)
     else:
         print(
-            f"Starting MCP OpenAPI Proxy on {host}:{port} with command: {' '.join(server_command)}"
+            f"Starting MCP OpenAPI Proxy on {host}:{port} with command: {server_command[0]}"
         )
 
     try:
@@ -107,9 +131,8 @@ def main(
                 env_dict[key] = value
 
         if env_path:
-            # Load environment variables from the specified file
-            load_dotenv(env_path)
-            env_dict.update(dict(os.environ))
+            # Variables from the file, not the whole proxy environment
+            env_dict.update({k: v for k, v in dotenv_values(env_path).items() if v is not None})
 
         # Set environment variables
         for key, value in env_dict.items():
@@ -138,6 +161,7 @@ def main(
             host,
             port,
             api_key=api_key,
+            tool_api_key=tool_api_key,
             strict_auth=strict_auth,
             cors_allow_origins=cors_allow_origins,
             server_type=server_type,
@@ -152,6 +176,7 @@ def main(
             root_path=root_path,
             headers=headers,
             hot_reload=hot_reload,
+            server_env=env_dict,
         )
     )
 

@@ -1,0 +1,447 @@
+"""Deleting or replacing a server stops its process, whether it started at boot or by hot reload."""
+
+import asyncio
+import json
+import subprocess
+from contextlib import asynccontextmanager
+
+import pytest
+from starlette.routing import Mount
+
+import mcpo.main
+from mcpo import mcp_management
+from mcpo.main import build_app
+
+SERVERS = {
+    "one": {"command": "npx", "args": ["-y", "pkg-one"]},
+    "two": {"command": "npx", "args": ["-y", "pkg-two"]},
+}
+
+
+def fake_stdio(events):
+    @asynccontextmanager
+    async def client(params, *args, **kwargs):
+        name = params.args[-1]
+        events.append(("start", name))
+        try:
+            await asyncio.Event().wait()  # a running process until cancelled
+            yield None, None
+        finally:
+            events.append(("stop", name))
+
+    return client
+
+
+def mounted(app):
+    return {route.path for route in app.routes if isinstance(route, Mount) and route.path not in ("/static",)}
+
+
+def run_startup(tmp_path, monkeypatch, scenario):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"mcpServers": SERVERS}))
+    monkeypatch.setattr(mcp_management, "CONFIG_PATH", str(path))
+    monkeypatch.setattr(mcp_management, "MARKETPLACE_CONFIG_PATH", str(tmp_path / "m.json"))
+    monkeypatch.setattr(mcp_management, "load_marketplace_templates", lambda: {
+        name: {"config_template": cfg} for name, cfg in SERVERS.items()
+    })
+    events = []
+    monkeypatch.setattr(mcpo.main, "stdio_client", fake_stdio(events))
+
+    async def main():
+        app = build_app(api_key="k", cors_allow_origins=[], config_path=str(path))
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0.05)
+            await scenario(app, events)
+            await asyncio.sleep(0.05)
+        app.state.hot_reloader.stop()
+
+    asyncio.run(main())
+    return events
+
+
+def test_startup_servers_are_registered_by_id(tmp_path, monkeypatch):
+    seen = {}
+
+    async def scenario(app, events):
+        seen.update({k: len(v) for k, v in app.state.server_tasks.items()})
+
+    run_startup(tmp_path, monkeypatch, scenario)
+    assert seen == {"one": 1, "two": 1}
+
+
+def test_stopping_a_startup_server_stops_its_process_and_only_its_own(tmp_path, monkeypatch):
+    seen = {}
+
+    async def scenario(app, events):
+        await app.state.hot_reloader.stop_server("one")
+        await asyncio.sleep(0.05)
+        seen["mounted"] = mounted(app)
+        seen["events"] = list(events)
+
+    run_startup(tmp_path, monkeypatch, scenario)
+
+    assert ("stop", "pkg-one") in seen["events"]
+    assert ("stop", "pkg-two") not in seen["events"]
+    assert "/one" not in seen["mounted"] and "/two" in seen["mounted"]
+
+
+def test_delete_stops_the_process_before_retiring_its_uid(tmp_path, monkeypatch):
+    order = []
+    seen = {}
+
+    async def scenario(app, events):
+        reloader = app.state.hot_reloader
+        real_stop = reloader.stop_server
+
+        async def stop(server_id):
+            await real_stop(server_id)
+            order.append(("stopped", server_id))
+
+        monkeypatch.setattr(reloader, "stop_server", stop)
+        monkeypatch.setattr(mcp_management, "retire_stdio_uid", lambda sid: order.append(("retired", sid)))
+        from httpx import ASGITransport, AsyncClient
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            seen["status"] = (await client.delete("/api/mcp/servers/one", headers={"Authorization": "Bearer k"})).status_code
+
+    events = run_startup(tmp_path, monkeypatch, scenario)
+
+    assert seen["status"] == 200
+    assert order == [("stopped", "one"), ("retired", "one")]
+    assert ("stop", "pkg-one") in events
+
+
+def kill_setup(tmp_path, monkeypatch, survivors):
+    record = tmp_path / "killed"
+    monkeypatch.setenv("MCPO_STDIO_KILL_COMMAND", json.dumps(["sh", "-c", f"echo {{uid}} >> {record}"]))
+    monkeypatch.setenv("MCPO_STDIO_UID_POOL", "20000:10000")
+    monkeypatch.setenv("MCPO_STDIO_UID_MAP", str(tmp_path / "uids.json"))
+    monkeypatch.setattr(mcp_management, "processes_of_uid", lambda uid: list(survivors))
+    return record
+
+
+def test_stopping_a_server_kills_every_process_of_its_uid(tmp_path, monkeypatch):
+    record = kill_setup(tmp_path, monkeypatch, survivors=[])
+    uid = mcp_management.stdio_uid("one", "npx pkg-one")
+
+    async def scenario(app, events):
+        await app.state.hot_reloader.stop_server("one")
+
+    run_startup(tmp_path, monkeypatch, scenario)
+
+    assert set(record.read_text().split()) == {str(uid)}
+
+
+def test_a_delete_that_cannot_stop_the_processes_changes_nothing(tmp_path, monkeypatch):
+    from fastapi import FastAPI
+
+    kill_setup(tmp_path, monkeypatch, survivors=[4242])
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"mcpServers": SERVERS}))
+    monkeypatch.setattr(mcp_management, "CONFIG_PATH", str(config))
+    monkeypatch.setattr(mcp_management, "MARKETPLACE_CONFIG_PATH", str(tmp_path / "m.json"))
+    uid = mcp_management.stdio_uid("one", "npx pkg-one")
+
+    class Reloader:
+        async def stop_server(self, server_id):
+            await mcp_management.kill_stdio_processes(server_id)
+
+    app = FastAPI()
+    mcp_management.apply_monkey_patch(app)
+    app.state.hot_reloader = Reloader()
+
+    from httpx import ASGITransport, AsyncClient
+
+    async def delete():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            return await client.delete("/api/mcp/servers/one")
+
+    response = asyncio.run(delete())
+
+    assert response.status_code == 500
+    assert "one" in json.loads(config.read_text())["mcpServers"]
+    assert uid not in json.loads((tmp_path / "uids.json").read_text())["retired"]
+
+
+def test_processes_of_uid_reads_proc():
+    import os
+
+    assert os.getpid() in mcp_management.processes_of_uid(os.getuid()) or not os.path.isdir("/proc")
+
+
+def test_processes_are_killed_before_the_client_cleanup_waits_for_them(tmp_path, monkeypatch):
+    order = []
+    kill_setup(tmp_path, monkeypatch, survivors=[])
+    mcp_management.stdio_uid("one", "npx pkg-one")
+
+    async def scenario(app, events):
+        reloader = app.state.hot_reloader
+        real_stop = reloader._stop_server
+
+        async def kill(server_id):
+            order.append("kill")
+
+        async def stop(server_id):
+            order.append("cleanup")
+            await real_stop(server_id)
+
+        import mcpo.hot_reload
+
+        monkeypatch.setattr(mcpo.hot_reload, "kill_stdio_processes", kill)
+        monkeypatch.setattr(reloader, "_stop_server", stop)
+        await reloader.stop_server("one")
+
+    run_startup(tmp_path, monkeypatch, scenario)
+
+    assert order[:2] == ["kill", "cleanup"]
+
+
+def test_zombies_do_not_count_as_surviving_processes(tmp_path, monkeypatch):
+    proc = tmp_path / "proc"
+    for pid, state, uid in [("10", "Z (zombie)", 29606), ("11", "S (sleeping)", 29606), ("12", "S (sleeping)", 1000)]:
+        (proc / pid).mkdir(parents=True)
+        (proc / pid / "status").write_text(f"Name:\tx\nState:\t{state}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+    monkeypatch.setattr(mcp_management, "PROC_ROOT", str(proc))
+
+    assert mcp_management.processes_of_uid(29606) == [11]
+
+
+def reload_with_kill_failures(tmp_path, monkeypatch, old, new, failing, error):
+    from fastapi import FastAPI
+
+    import mcpo.hot_reload
+    from mcpo.hot_reload import MCPHotReloader
+
+    monkeypatch.setenv("MCPO_STDIO_UID_POOL", "20000:10000")
+    monkeypatch.setenv("MCPO_STDIO_UID_MAP", str(tmp_path / "uids.json"))
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"mcpServers": new}))
+    reloader = MCPHotReloader(FastAPI(), str(path))
+    reloader.current_config = {"mcpServers": dict(old)}
+    started = []
+
+    async def kill(server_id):
+        if server_id in failing:
+            raise error
+
+    async def noop(*_args):
+        return None
+
+    async def start(server_id, config):
+        started.append(server_id)
+
+    monkeypatch.setattr(mcpo.hot_reload, "kill_stdio_processes", kill)
+    monkeypatch.setattr(reloader, "_stop_server", noop)
+    monkeypatch.setattr(reloader, "_start_server", start)
+    uids = {sid: mcp_management.stdio_uid(sid, "npx x") for sid in old}
+    asyncio.run(reloader._reload_servers())
+    retired = json.loads((tmp_path / "uids.json").read_text())["retired"]
+    return reloader, started, uids, retired
+
+
+def test_a_removed_server_whose_processes_survive_stays_tracked(tmp_path, monkeypatch):
+    reloader, _started, uids, retired = reload_with_kill_failures(
+        tmp_path, monkeypatch, old={"a": SERVERS["one"], "b": SERVERS["two"]}, new={}, failing={"a"},
+        error=RuntimeError("survived"),
+    )
+
+    assert "a" in reloader.current_config["mcpServers"]
+    assert "b" not in reloader.current_config["mcpServers"]
+    assert uids["a"] not in retired and uids["b"] in retired
+    assert reloader.stop_failed == {"a"}
+
+
+def test_a_modified_server_whose_processes_survive_is_not_started_again(tmp_path, monkeypatch):
+    changed = {"command": "npx", "args": ["-y", "pkg-one", "--flag"]}
+    reloader, started, _uids, _retired = reload_with_kill_failures(
+        tmp_path, monkeypatch, old={"a": SERVERS["one"], "b": SERVERS["two"]},
+        new={"a": changed, "b": {**SERVERS["two"], "args": ["-y", "pkg-two", "--x"]}}, failing={"a"},
+        error=RuntimeError("survived"),
+    )
+
+    assert started == ["b"]
+    assert reloader.current_config["mcpServers"]["a"] == SERVERS["one"]
+
+
+@pytest.mark.parametrize("error", [subprocess.TimeoutExpired("kill", 10), OSError("no launcher")])
+def test_kill_command_errors_are_survivors_and_the_reload_completes(tmp_path, monkeypatch, error):
+    monkeypatch.setenv("MCPO_STDIO_KILL_COMMAND", json.dumps(["kill-it", "{uid}"]))
+    monkeypatch.setenv("MCPO_STDIO_UID_POOL", "20000:10000")
+    monkeypatch.setenv("MCPO_STDIO_UID_MAP", str(tmp_path / "uids.json"))
+    mcp_management.stdio_uid("a", "npx x")
+
+    def raise_error(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(mcp_management, "_kill_until_gone", raise_error)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(mcp_management.kill_stdio_processes("a"))
+
+
+def test_a_delete_whose_processes_survive_reports_the_server_stopped(tmp_path, monkeypatch):
+    survivors = [4242]
+    kill_setup(tmp_path, monkeypatch, survivors=survivors)
+    uid = mcp_management.stdio_uid("one", "npx pkg-one")
+    calls = {"n": 0}
+    real = mcp_management._kill_until_gone
+
+    def first_ok_then_survive(argv, kill_uid, attempts=5):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return True
+        return real(argv, kill_uid, attempts)
+
+    monkeypatch.setattr(mcp_management, "_kill_until_gone", first_ok_then_survive)
+    seen = {}
+
+    async def scenario(app, events):
+        from httpx import ASGITransport, AsyncClient
+
+        headers = {"Authorization": "Bearer k"}
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            first = await client.delete("/api/mcp/servers/one", headers=headers)
+            seen["first"] = (first.status_code, first.json()["detail"])
+            seen["listed"] = (await client.get("/api/mcp/servers", headers=headers)).json()["one"].get("status")
+            seen["health"] = (await client.get("/api/mcp/servers/one/health", headers=headers)).json()["status"]
+            survivors.clear()
+            seen["retry"] = (await client.delete("/api/mcp/servers/one", headers=headers)).status_code
+
+    run_startup(tmp_path, monkeypatch, scenario)
+
+    assert seen["first"][0] == 500 and "stopped" in seen["first"][1]
+    assert seen["listed"] == "stop_failed"
+    assert seen["health"] == "stop_failed"
+    assert seen["retry"] == 200
+    assert uid in json.loads((tmp_path / "uids.json").read_text())["retired"]
+
+
+def reloader_with_failed_stop(tmp_path, monkeypatch, new_config, kill_fails):
+    from fastapi import FastAPI
+
+    import mcpo.hot_reload
+    from mcpo.hot_reload import MCPHotReloader
+
+    monkeypatch.setenv("MCPO_STDIO_UID_POOL", "20000:10000")
+    monkeypatch.setenv("MCPO_STDIO_UID_MAP", str(tmp_path / "uids.json"))
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"mcpServers": new_config}))
+    reloader = MCPHotReloader(FastAPI(), str(path))
+    reloader.current_config = {"mcpServers": {"a": SERVERS["one"]}}
+    reloader.stop_failed = {"a"}
+    started = []
+
+    async def kill(server_id):
+        if kill_fails:
+            raise RuntimeError("survived")
+
+    async def noop(*_args):
+        return None
+
+    async def start(server_id, config):
+        started.append((server_id, config))
+
+    monkeypatch.setattr(mcpo.hot_reload, "kill_stdio_processes", kill)
+    monkeypatch.setattr(reloader, "_stop_server", noop)
+    monkeypatch.setattr(reloader, "_start_server", start)
+    return reloader, started
+
+
+def test_a_reverted_config_still_retries_and_restarts_a_failed_stop(tmp_path, monkeypatch):
+    # The config now equals the tracked (old) config, so there is no diff.
+    reloader, started = reloader_with_failed_stop(tmp_path, monkeypatch, {"a": SERVERS["one"]}, kill_fails=False)
+
+    asyncio.run(reloader._reload_servers())
+
+    assert started == [("a", SERVERS["one"])]
+    assert reloader.stop_failed == set()
+
+
+def test_a_failed_stop_that_still_fails_stays_pending(tmp_path, monkeypatch):
+    reloader, started = reloader_with_failed_stop(tmp_path, monkeypatch, {"a": SERVERS["one"]}, kill_fails=True)
+
+    asyncio.run(reloader._reload_servers())
+
+    assert started == []
+    assert reloader.stop_failed == {"a"}
+
+
+def test_a_removed_failed_stop_is_retired_once_its_processes_are_gone(tmp_path, monkeypatch):
+    reloader, started = reloader_with_failed_stop(tmp_path, monkeypatch, {}, kill_fails=False)
+    uid = mcp_management.stdio_uid("a", "npx pkg-one")
+
+    asyncio.run(reloader._reload_servers())
+
+    assert started == []
+    assert "a" not in reloader.current_config["mcpServers"]
+    assert uid in json.loads((tmp_path / "uids.json").read_text())["retired"]
+
+
+def management_with_tracked_survivor(tmp_path, monkeypatch, kill_fails):
+    from fastapi import FastAPI
+
+    kill_setup(tmp_path, monkeypatch, survivors=[4242] if kill_fails else [])
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"mcpServers": {"b": SERVERS["two"]}}))
+    monkeypatch.setattr(mcp_management, "CONFIG_PATH", str(config))
+    monkeypatch.setattr(mcp_management, "MARKETPLACE_CONFIG_PATH", str(tmp_path / "m.json"))
+    uid = mcp_management.stdio_uid("a", "npx pkg-one")
+
+    class Reloader:
+        def __init__(self):
+            self.stop_failed = {"a"}
+            self.current_config = {"mcpServers": {"a": SERVERS["one"], "b": SERVERS["two"]}}
+
+        async def stop_server(self, server_id):
+            await mcp_management.kill_stdio_processes(server_id)
+            self.stop_failed.discard(server_id)
+            self.current_config["mcpServers"].pop(server_id, None)
+
+    app = FastAPI()
+    mcp_management.apply_monkey_patch(app)
+    app.state.hot_reloader = Reloader()
+    return app, uid
+
+
+def call(app, method, path):
+    from httpx import ASGITransport, AsyncClient
+
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            return await client.request(method, path)
+
+    return asyncio.run(run())
+
+
+def test_a_removed_survivor_is_listed_as_stop_failed(tmp_path, monkeypatch):
+    app, _uid = management_with_tracked_survivor(tmp_path, monkeypatch, kill_fails=True)
+
+    listed = call(app, "GET", "/api/mcp/servers").json()
+
+    assert listed["a"]["status"] == "stop_failed"
+    assert "status" not in listed["b"]
+
+
+def test_delete_retries_the_stop_of_a_removed_survivor(tmp_path, monkeypatch):
+    app, uid = management_with_tracked_survivor(tmp_path, monkeypatch, kill_fails=False)
+
+    response = call(app, "DELETE", "/api/mcp/servers/a")
+
+    assert response.status_code == 200
+    assert uid in json.loads((tmp_path / "uids.json").read_text())["retired"]
+    assert "a" not in call(app, "GET", "/api/mcp/servers").json()
+
+
+def test_delete_of_a_removed_survivor_that_still_survives_answers_500(tmp_path, monkeypatch):
+    app, uid = management_with_tracked_survivor(tmp_path, monkeypatch, kill_fails=True)
+
+    response = call(app, "DELETE", "/api/mcp/servers/a")
+
+    assert response.status_code == 500
+    assert uid not in json.loads((tmp_path / "uids.json").read_text())["retired"]
+
+
+def test_delete_of_an_unknown_server_is_still_404(tmp_path, monkeypatch):
+    app, _uid = management_with_tracked_survivor(tmp_path, monkeypatch, kill_fails=False)
+
+    assert call(app, "DELETE", "/api/mcp/servers/nope").status_code == 404

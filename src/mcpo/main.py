@@ -1,13 +1,12 @@
 import asyncio
 import json
-import os
 import logging
 import socket
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Optional
 
 import uvicorn
-from fastapi import Depends, FastAPI
+from fastapi import APIRouter, Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
@@ -20,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 from mcpo.utils.main import get_model_fields, get_tool_handler
 from mcpo.utils.auth import get_verify_api_key, APIKeyMiddleware
+from mcpo.mcp_management import loggable_url, stdio_command, stdio_environment
 
 
 async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
@@ -39,6 +39,12 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
     tools_result = await session.list_tools()
     tools = tools_result.tools
 
+    # Build the new routes on a scratch router first; only when every tool
+    # built do they replace the previous registration's routes (a reconnect
+    # re-registers), so each tool has exactly one route with the new schema
+    # and a failure leaves the old routes serving.
+    scratch = APIRouter()
+
     for tool in tools:
         endpoint_name = tool.name
         endpoint_description = tool.description
@@ -51,7 +57,6 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
             inputSchema.get("properties", {}),
             inputSchema.get("required", []),
             schema_defs=inputSchema.get("$defs", {}),
-            root_schema=inputSchema,
         )
 
         response_model_fields = None
@@ -61,23 +66,29 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
                 outputSchema.get("properties", {}),
                 outputSchema.get("required", []),
                 schema_defs=outputSchema.get("$defs", {}),
-                root_schema=outputSchema,
             )
 
         tool_handler = get_tool_handler(
-            session,
             endpoint_name,
             form_model_fields,
             response_model_fields,
         )
 
-        app.post(
+        scratch.post(
             f"/{endpoint_name}",
             summary=endpoint_name.replace("_", " ").title(),
             description=endpoint_description,
             response_model_exclude_none=True,
             dependencies=[Depends(api_dependency)] if api_dependency else [],
         )(tool_handler)
+
+    previous = {id(route) for route in getattr(app.state, "tool_routes", [])}
+    app.router.routes[:] = [route for route in app.router.routes if id(route) not in previous] + scratch.routes
+    app.state.tool_routes = list(scratch.routes)
+
+    # FastAPI caches the OpenAPI document on first request; drop it so a
+    # fetch made before (re)registration doesn't hide these tools.
+    app.openapi_schema = None
 
 
 async def start_server_connection_background(sub_app: FastAPI):
@@ -95,6 +106,13 @@ async def start_server_connection_background(sub_app: FastAPI):
         sub_app.state.connection_status = "failed"
 
 
+def register_server_task(app: FastAPI, server_id: str, task: "asyncio.Task") -> None:
+    """Record a task that keeps a server's connection (and process) alive, by server id."""
+    if not hasattr(app.state, "server_tasks"):
+        app.state.server_tasks = {}
+    app.state.server_tasks.setdefault(server_id, []).append(task)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     server_type = getattr(app.state, "server_type", "stdio")
@@ -104,6 +122,7 @@ async def lifespan(app: FastAPI):
 
     args = args if isinstance(args, list) else [args]
     api_dependency = getattr(app.state, "api_dependency", None)
+    headers = getattr(app.state, "headers", None) or None
 
     if (server_type == "stdio" and not command) or (
         server_type == "sse" and not args[0]
@@ -121,6 +140,8 @@ async def lifespan(app: FastAPI):
                     start_server_connection_background(route.app)
                 )
                 connection_tasks.append(task)
+                server_id = getattr(route.app.state, "server_id", route.path.lstrip("/"))
+                register_server_task(app, server_id, task)
         
         # Store tasks for cleanup later
         app.state.connection_tasks = connection_tasks
@@ -138,9 +159,12 @@ async def lifespan(app: FastAPI):
                         pass
     else:
         if server_type == "stdio":
+            wrapped_command, wrapped_args = stdio_command(
+                command, args, server_id=getattr(app.state, "server_id", "default")
+            )
             server_params = StdioServerParameters(
-                command=command,
-                args=args,
+                command=wrapped_command,
+                args=wrapped_args,
                 env={**env},
             )
 
@@ -178,12 +202,14 @@ async def lifespan(app: FastAPI):
                 while True:
                     attempt += 1
                     try:
-                        logger.info(f"Connecting to SSE endpoint: {args[0]} (attempt {attempt})")
-                        async with sse_client(url=args[0], sse_read_timeout=None) as (
+                        logger.info(f"Connecting to SSE endpoint: {loggable_url(args[0])} (attempt {attempt})")
+                        async with sse_client(
+                            url=args[0], sse_read_timeout=None, headers=headers
+                        ) as (
                             reader,
                             writer,
                         ):
-                            logger.info(f"✅ Successfully connected to SSE endpoint: {args[0]}")
+                            logger.info(f"✅ Successfully connected to SSE endpoint: {loggable_url(args[0])}")
                             async with ClientSession(reader, writer) as session:
                                 app.state.session = session
                                 app.state.sse_server_status = "healthy"
@@ -199,7 +225,7 @@ async def lifespan(app: FastAPI):
                                         # Try to list tools to verify connection is alive
                                         await session.list_tools()
                                 except Exception as disconnect_error:
-                                    logger.warning(f"SSE connection lost for {args[0]}: {disconnect_error}")
+                                    logger.warning(f"SSE connection lost for {loggable_url(args[0])}: {disconnect_error}")
                                     app.state.sse_server_status = "unhealthy"
                                     app.state.session = None
                                     
@@ -208,12 +234,12 @@ async def lifespan(app: FastAPI):
                                     
                     except Exception as e:
                         last_error = str(e)
-                        logger.warning(f"❌ Failed to connect to SSE endpoint {args[0]} (attempt {attempt}): {e}")
+                        logger.warning(f"❌ Failed to connect to SSE endpoint {loggable_url(args[0])} (attempt {attempt}): {e}")
                         app.state.sse_last_error = last_error
                         
                         # Stop retrying for permanent errors
                         if is_permanent_error(last_error):
-                            logger.error(f"🚫 Permanent error detected for {args[0]}. Stopping retries: {e}")
+                            logger.error(f"🚫 Permanent error detected for {loggable_url(args[0])}. Stopping retries: {e}")
                             app.state.sse_server_status = "error"
                             return
                         
@@ -249,7 +275,7 @@ async def lifespan(app: FastAPI):
                 url = f"{url}/"
 
             # Connect using streamablehttp_client from the SDK, similar to sse_client
-            async with streamablehttp_client(url=url) as (
+            async with streamablehttp_client(url=url, headers=headers) as (
                 reader,
                 writer,
                 _,  # get_session_id callback not needed for ClientSession
@@ -260,16 +286,26 @@ async def lifespan(app: FastAPI):
                     yield
 
 
-async def run(
-    host: str = "127.0.0.1",
-    port: int = 8000,
+def cors_options(cors_allow_origins) -> dict:
+    """CORS settings; credentials are never allowed together with a wildcard origin."""
+    origins = list(cors_allow_origins or [])
+    return {
+        "allow_origins": origins,
+        "allow_credentials": "*" not in origins,
+        "allow_methods": ["*"],
+        "allow_headers": ["*"],
+    }
+
+
+def build_app(
     api_key: Optional[str] = "",
-    cors_allow_origins=["*"],
+    cors_allow_origins=None,
     **kwargs,
-):
-    # Server API Key
-    api_dependency = get_verify_api_key(api_key) if api_key else None
-    strict_auth = kwargs.get("strict_auth", False)
+) -> FastAPI:
+    """Build the mcpo app with its middleware, management APIs and MCP servers."""
+    # A second key that may call tools but not the management APIs.
+    tool_api_key = kwargs.get("tool_api_key") or None
+    api_dependency = get_verify_api_key(api_key, tool_api_key) if api_key else None
 
     # MCP Server
     server_type = kwargs.get(
@@ -287,6 +323,182 @@ async def run(
     )
     version = kwargs.get("version") or "1.0"
 
+    ssl_certfile = kwargs.get("ssl_certfile")
+    ssl_keyfile = kwargs.get("ssl_keyfile")
+    path_prefix = kwargs.get("path_prefix") or "/"
+
+    main_app = FastAPI(
+        title=name,
+        description=description,
+        version=version,
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
+        lifespan=lifespan,
+    )
+
+    # The key guards every route, including docs, mounted servers (also those
+    # added by hot reload) and the management APIs.
+    if api_key:
+        main_app.add_middleware(APIKeyMiddleware, api_key=api_key, tool_api_key=tool_api_key)
+
+    # Added last so it runs first: preflights and 401s carry CORS headers.
+    main_app.add_middleware(CORSMiddleware, **cors_options(cors_allow_origins))
+
+    # The management APIs start processes and edit server configs, so they
+    # exist only behind an API key.
+    if api_key:
+        try:
+            logger.info("Adding Nova MCP Marketplace APIs...")
+            from mcpo.mcp_management import apply_monkey_patch
+            from mcpo.environment_management import apply_environment_patch
+            apply_monkey_patch(main_app)
+            apply_environment_patch(main_app)
+            logger.info("✅ Nova MCP Marketplace APIs added successfully!")
+
+            # Enable hot reload for zero-downtime config changes
+            if config_path:
+                logger.info("Enabling hot reload for zero-downtime config changes...")
+                try:
+                    from mcpo.hot_reload import apply_hot_reload_patch
+                    apply_hot_reload_patch(main_app, config_path)
+                    logger.info("✅ Zero-downtime hot reload enabled!")
+                except ImportError as e:
+                    logger.warning(f"Full hot reload dependencies not available ({e}), falling back to simple hot reload...")
+                    from mcpo.simple_hot_reload import apply_simple_hot_reload
+                    apply_simple_hot_reload(main_app, config_path)
+                    logger.info("✅ Simple hot reload enabled!")
+            else:
+                logger.info("Note: Hot reload disabled (no config file provided)")
+        except Exception as e:
+            logger.warning(f"Failed to add marketplace APIs: {e}")
+    else:
+        logger.warning("No API key configured: the management APIs are disabled")
+
+    if server_type == "sse":
+        logger.info(
+            f"Configuring for a single SSE MCP Server with URL {loggable_url(server_command[0])}"
+        )
+        main_app.state.server_type = "sse"
+        main_app.state.args = server_command[0]  # Expects URL as the first element
+        main_app.state.api_dependency = api_dependency
+    elif server_type == "streamablehttp" or server_type == "streamable_http":
+        logger.info(
+            f"Configuring for a single StreamableHTTP MCP Server with URL {loggable_url(server_command[0])}"
+        )
+        main_app.state.server_type = "streamablehttp"
+        main_app.state.args = server_command[0]  # Expects URL as the first element
+        main_app.state.api_dependency = api_dependency
+    elif server_command:  # This handles stdio
+        logger.info(
+            f"Configuring for a single Stdio MCP Server with command: {server_command[0]}"
+        )
+        main_app.state.server_type = "stdio"  # Explicitly set type
+        main_app.state.command = server_command[0]
+        main_app.state.args = server_command[1:]
+        main_app.state.env = stdio_environment(kwargs.get("server_env"))
+        main_app.state.api_dependency = api_dependency
+    elif config_path:
+        logger.info(f"Loading MCP server configurations from: {config_path}")
+        # Hot reload copies this onto servers added at runtime.
+        main_app.state.api_dependency = api_dependency
+        with open(config_path, "r") as f:
+            config_data = json.load(f)
+
+        mcp_servers = config_data.get("mcpServers", {})
+        if not mcp_servers:
+            logger.error(f"No 'mcpServers' found in config file: {config_path}")
+            raise ValueError("No 'mcpServers' found in config file.")
+
+        logger.info("Configured MCP Servers:")
+        for server_name_cfg, server_cfg_details in mcp_servers.items():
+            if server_cfg_details.get("command"):
+                logger.info(
+                    f"  Configuring Stdio MCP Server '{server_name_cfg}' with command: {server_cfg_details['command']}"
+                )
+            elif server_cfg_details.get("type") == "sse" and server_cfg_details.get(
+                "url"
+            ):
+                logger.info(
+                    f"  Configuring SSE MCP Server '{server_name_cfg}' with URL: {loggable_url(server_cfg_details['url'])}"
+                )
+            elif (
+                server_cfg_details.get("type") == "streamablehttp"
+                or server_cfg_details.get("type") == "streamable_http"
+            ) and server_cfg_details.get("url"):
+                logger.info(
+                    f"  Configuring StreamableHTTP MCP Server '{server_name_cfg}' with URL: {loggable_url(server_cfg_details['url'])}"
+                )
+            elif server_cfg_details.get("url"):  # Fallback for old SSE config
+                logger.info(
+                    f"  Configuring SSE (fallback) MCP Server '{server_name_cfg}' with URL: {loggable_url(server_cfg_details['url'])}"
+                )
+            else:
+                logger.warning(
+                    f"  Unknown configuration for MCP server: {server_name_cfg}"
+                )
+
+        main_app.description += "\n\n- **available tools**："
+        for server_name, server_cfg in mcp_servers.items():
+            sub_app = FastAPI(
+                title=f"{server_name}",
+                description=f"{server_name} MCP Server\n\n- [back to tool list](/docs)",
+                version="1.0",
+                lifespan=lifespan,
+            )
+
+            if server_cfg.get("command"):
+                # stdio
+                sub_app.state.server_type = "stdio"
+                sub_app.state.command = server_cfg["command"]
+                sub_app.state.args = server_cfg.get("args", [])
+                sub_app.state.env = stdio_environment(server_cfg.get("env"))
+
+            server_config_type = server_cfg.get("type")
+            if server_config_type == "sse" and server_cfg.get("url"):
+                sub_app.state.server_type = "sse"
+                sub_app.state.args = server_cfg["url"]
+            elif (
+                server_config_type == "streamablehttp"
+                or server_config_type == "streamable_http"
+            ) and server_cfg.get("url"):
+                # Store the URL with trailing slash to avoid redirects
+                url = server_cfg["url"]
+                if not url.endswith("/"):
+                    url = f"{url}/"
+                sub_app.state.server_type = "streamablehttp"
+                sub_app.state.args = url
+            elif not server_config_type and server_cfg.get(
+                "url"
+            ):  # Fallback for old SSE config
+                sub_app.state.server_type = "sse"
+                sub_app.state.args = server_cfg["url"]
+
+            sub_app.state.headers = server_cfg.get("headers")
+            sub_app.state.server_id = server_name
+            sub_app.state.api_dependency = api_dependency
+
+            main_app.mount(f"{path_prefix}{server_name}", sub_app)
+            main_app.description += f"\n    - [{server_name}](/{server_name}/docs)"
+    else:
+        logger.error("MCPO server_command or config_path must be provided.")
+        raise ValueError("You must provide either server_command or config.")
+
+    return main_app
+
+
+
+async def run(
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    api_key: Optional[str] = "",
+    cors_allow_origins=["*"],
+    **kwargs,
+):
+    name = kwargs.get("name") or "MCP OpenAPI Proxy"
+    version = kwargs.get("version") or "1.0"
+    description = (
+        kwargs.get("description") or "Automatically generated API from MCP Tool Schemas"
+    )
     ssl_certfile = kwargs.get("ssl_certfile")
     ssl_keyfile = kwargs.get("ssl_keyfile")
     path_prefix = kwargs.get("path_prefix") or "/"
@@ -309,174 +521,9 @@ async def run(
         logger.info(f"  SSL Key File: {ssl_keyfile}")
     logger.info(f"  Path Prefix: {path_prefix}")
 
-    main_app = FastAPI(
-        title=name,
-        description=description,
-        version=version,
-        ssl_certfile=ssl_certfile,
-        ssl_keyfile=ssl_keyfile,
-        lifespan=lifespan,
+    main_app = build_app(
+        api_key=api_key, cors_allow_origins=cors_allow_origins, **kwargs
     )
-
-    main_app.add_middleware(
-        CORSMiddleware,
-        allow_origins=cors_allow_origins or ["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # Add middleware to protect also documentation and spec
-    if api_key and strict_auth:
-        main_app.add_middleware(APIKeyMiddleware, api_key=api_key)
-
-    # Add Nova MCP Marketplace APIs
-    try:
-        logger.info("Adding Nova MCP Marketplace APIs...")
-        from mcpo.mcp_management import apply_monkey_patch
-        from mcpo.environment_management import apply_environment_patch
-        apply_monkey_patch(main_app)
-        apply_environment_patch(main_app)
-        logger.info("✅ Nova MCP Marketplace APIs added successfully!")
-        
-        # Enable hot reload for zero-downtime config changes
-        if config_path:
-            logger.info("Enabling hot reload for zero-downtime config changes...")
-            try:
-                from mcpo.hot_reload import apply_hot_reload_patch
-                apply_hot_reload_patch(main_app, config_path)
-                logger.info("✅ Zero-downtime hot reload enabled!")
-            except ImportError as e:
-                logger.warning(f"Full hot reload dependencies not available ({e}), falling back to simple hot reload...")
-                from mcpo.simple_hot_reload import apply_simple_hot_reload
-                apply_simple_hot_reload(main_app, config_path)
-                logger.info("✅ Simple hot reload enabled!")
-        else:
-            logger.info("Note: Hot reload disabled (no config file provided)")
-    except Exception as e:
-        logger.warning(f"Failed to add marketplace APIs: {e}")
-
-    if server_type == "sse":
-        logger.info(
-            f"Configuring for a single SSE MCP Server with URL {server_command[0]}"
-        )
-        main_app.state.server_type = "sse"
-        main_app.state.args = server_command[0]  # Expects URL as the first element
-        main_app.state.api_dependency = api_dependency
-    elif server_type == "streamablehttp" or server_type == "streamable_http":
-        logger.info(
-            f"Configuring for a single StreamableHTTP MCP Server with URL {server_command[0]}"
-        )
-        main_app.state.server_type = "streamablehttp"
-        main_app.state.args = server_command[0]  # Expects URL as the first element
-        main_app.state.api_dependency = api_dependency
-    elif server_command:  # This handles stdio
-        logger.info(
-            f"Configuring for a single Stdio MCP Server with command: {' '.join(server_command)}"
-        )
-        main_app.state.server_type = "stdio"  # Explicitly set type
-        main_app.state.command = server_command[0]
-        main_app.state.args = server_command[1:]
-        main_app.state.env = os.environ.copy()
-        main_app.state.api_dependency = api_dependency
-    elif config_path:
-        logger.info(f"Loading MCP server configurations from: {config_path}")
-        with open(config_path, "r") as f:
-            config_data = json.load(f)
-
-        mcp_servers = config_data.get("mcpServers", {})
-        if not mcp_servers:
-            logger.error(f"No 'mcpServers' found in config file: {config_path}")
-            raise ValueError("No 'mcpServers' found in config file.")
-
-        logger.info("Configured MCP Servers:")
-        for server_name_cfg, server_cfg_details in mcp_servers.items():
-            if server_cfg_details.get("command"):
-                args_info = (
-                    f" with args: {server_cfg_details['args']}"
-                    if server_cfg_details.get("args")
-                    else ""
-                )
-                logger.info(
-                    f"  Configuring Stdio MCP Server '{server_name_cfg}' with command: {server_cfg_details['command']}{args_info}"
-                )
-            elif server_cfg_details.get("type") == "sse" and server_cfg_details.get(
-                "url"
-            ):
-                logger.info(
-                    f"  Configuring SSE MCP Server '{server_name_cfg}' with URL: {server_cfg_details['url']}"
-                )
-            elif (
-                server_cfg_details.get("type") == "streamablehttp"
-                or server_cfg_details.get("type") == "streamable_http"
-            ) and server_cfg_details.get("url"):
-                logger.info(
-                    f"  Configuring StreamableHTTP MCP Server '{server_name_cfg}' with URL: {server_cfg_details['url']}"
-                )
-            elif server_cfg_details.get("url"):  # Fallback for old SSE config
-                logger.info(
-                    f"  Configuring SSE (fallback) MCP Server '{server_name_cfg}' with URL: {server_cfg_details['url']}"
-                )
-            else:
-                logger.warning(
-                    f"  Unknown configuration for MCP server: {server_name_cfg}"
-                )
-
-        main_app.description += "\n\n- **available tools**："
-        for server_name, server_cfg in mcp_servers.items():
-            sub_app = FastAPI(
-                title=f"{server_name}",
-                description=f"{server_name} MCP Server\n\n- [back to tool list](/docs)",
-                version="1.0",
-                lifespan=lifespan,
-            )
-
-            sub_app.add_middleware(
-                CORSMiddleware,
-                allow_origins=cors_allow_origins or ["*"],
-                allow_credentials=True,
-                allow_methods=["*"],
-                allow_headers=["*"],
-            )
-
-            if server_cfg.get("command"):
-                # stdio
-                sub_app.state.server_type = "stdio"
-                sub_app.state.command = server_cfg["command"]
-                sub_app.state.args = server_cfg.get("args", [])
-                sub_app.state.env = {**os.environ, **server_cfg.get("env", {})}
-
-            server_config_type = server_cfg.get("type")
-            if server_config_type == "sse" and server_cfg.get("url"):
-                sub_app.state.server_type = "sse"
-                sub_app.state.args = server_cfg["url"]
-            elif (
-                server_config_type == "streamablehttp"
-                or server_config_type == "streamable_http"
-            ) and server_cfg.get("url"):
-                # Store the URL with trailing slash to avoid redirects
-                url = server_cfg["url"]
-                if not url.endswith("/"):
-                    url = f"{url}/"
-                sub_app.state.server_type = "streamablehttp"
-                sub_app.state.args = url
-            elif not server_config_type and server_cfg.get(
-                "url"
-            ):  # Fallback for old SSE config
-                sub_app.state.server_type = "sse"
-                sub_app.state.args = server_cfg["url"]
-
-            # Add middleware to protect also documentation and spec
-            if api_key and strict_auth:
-                sub_app.add_middleware(APIKeyMiddleware, api_key=api_key)
-
-            sub_app.state.api_dependency = api_dependency
-
-            main_app.mount(f"{path_prefix}{server_name}", sub_app)
-            main_app.description += f"\n    - [{server_name}](/{server_name}/docs)"
-    else:
-        logger.error("MCPO server_command or config_path must be provided.")
-        raise ValueError("You must provide either server_command or config.")
 
     logger.info("Uvicorn server starting...")
     config = uvicorn.Config(

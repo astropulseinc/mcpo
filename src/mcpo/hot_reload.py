@@ -22,6 +22,15 @@ except ImportError:
     FileSystemEventHandler = None
     FileModifiedEvent = None
 
+from .mcp_management import (
+    describe_server_config,
+    kill_stdio_processes,
+    loggable_url,
+    retire_stdio_uid,
+    stdio_command,
+    stdio_environment,
+)
+
 logger = logging.getLogger(__name__)
 
 if WATCHDOG_AVAILABLE:
@@ -130,6 +139,7 @@ class MCPHotReloader:
         self.observer = None
         self.current_config = None
         self._sessions = {}  # Store active MCP sessions
+        self.stop_failed: set = set()  # Stopped servers whose processes survived
         
         # Track start time for uptime calculation
         import time
@@ -231,6 +241,10 @@ class MCPHotReloader:
             # This ensures that delete->add cycles are properly handled
             logger.info("🔄 Processing config change (file modification detected)")
             
+            # Retry stops that failed before, whatever this change is (even
+            # none: a config reverted to a failed server's old config).
+            await self._retry_failed_stops(new_config)
+
             old_servers = set(self.current_config.get("mcpServers", {}).keys())
             new_servers = set(new_config.get("mcpServers", {}).keys())
             
@@ -256,18 +270,35 @@ class MCPHotReloader:
                 self.current_config = new_config
                 return
             
-            # Stop removed/modified servers
+            # Stop removed/modified servers. A server whose processes survive
+            # is a survivor: not started again (no second instance), its uid
+            # not retired, and it stays in current_config under its old
+            # config so the next reload (or a DELETE) retries the stop.
+            survivors = set()
             for server_id in removed | modified:
                 logger.info(f"🛑 Stopping server: {server_id}")
-                await self._stop_server(server_id)
-            
-            # Start added/modified servers
-            for server_id in added | modified:
+                if await self.stop_server_processes(server_id):
+                    self.stop_failed.discard(server_id)
+                else:
+                    survivors.add(server_id)
+            # A removed server's uid is retired after its processes are gone,
+            # so a server added later under this id gets a fresh home.
+            for server_id in removed - survivors:
+                retire_stdio_uid(server_id)
+
+            # Start added/modified servers (never a survivor)
+            for server_id in (added | modified) - survivors:
                 server_config = new_config["mcpServers"][server_id]
-                logger.info(f"🚀 Starting server: {server_id} with config: {server_config}")
-                await self._start_server(server_id, server_config)
-            
-            self.current_config = new_config
+                logger.info(f"🚀 Starting server: {server_id} ({describe_server_config(server_config)})")
+                try:
+                    await self._start_server(server_id, server_config)
+                except Exception as e:
+                    logger.error(f"❌ Failed to start {server_id}: {e}")
+
+            tracked = json.loads(json.dumps(new_config))
+            for server_id in survivors:
+                tracked.setdefault("mcpServers", {})[server_id] = self.current_config["mcpServers"][server_id]
+            self.current_config = tracked
             
             logger.info(f"✅ ZERO-DOWNTIME RELOAD COMPLETED SUCCESSFULLY")
             logger.info(f"📊 Final state - Added: {added}, Removed: {removed}, Modified: {modified}")
@@ -339,8 +370,64 @@ class MCPHotReloader:
                 
                 del self._sessions[server_id]
                 logger.info(f"✅ Gracefully stopped MCP server: {server_id}")
+            elif server_id in getattr(self.app.state, "server_tasks", {}):
+                # A server started with the app (from config.json at boot):
+                # its connection task owns the process.
+                self._unmount_server(server_id)
+                await self._cleanup_background_tasks(server_id)
+                logger.info(f"✅ Stopped MCP server started at boot: {server_id}")
         except Exception as e:
             logger.error(f"Failed to stop server {server_id}: {e}")
+
+    async def _retry_failed_stops(self, new_config: dict[str, Any]) -> None:
+        """Stop again every server whose stop failed. Once stopped, start it
+        under its current config if it is still configured, else retire its
+        uid and stop tracking it."""
+        for server_id in sorted(self.stop_failed):
+            if not await self.stop_server_processes(server_id):
+                continue
+            tracked = self.current_config.setdefault("mcpServers", {})
+            config = new_config.get("mcpServers", {}).get(server_id)
+            if config is None:
+                tracked.pop(server_id, None)
+                retire_stdio_uid(server_id)
+                continue
+            logger.info(f"🚀 Restarting {server_id} after its stop was retried")
+            try:
+                await self._start_server(server_id, config)
+            except Exception as e:
+                logger.error(f"❌ Failed to start {server_id}: {e}")
+            tracked[server_id] = config
+
+    async def stop_server_processes(self, server_id: str) -> bool:
+        """Kill, clean up, kill again; True when no process of the server is left.
+
+        On failure the server is recorded in stop_failed: unmounted, not
+        running tools, and retried by the next reload or DELETE.
+        """
+        try:
+            await kill_stdio_processes(server_id)
+            await self._stop_server(server_id)
+            await kill_stdio_processes(server_id)
+        except RuntimeError as e:
+            logger.error(f"❌ {e}; its uid stays assigned, and the stop will be retried")
+            self.stop_failed.add(server_id)
+            return False
+        self.stop_failed.discard(server_id)
+        return True
+
+    async def stop_server(self, server_id: str):
+        """Stop a server now, whether it started at boot or by hot reload.
+
+        Raises RuntimeError when processes of its uid survive.
+        """
+        # Kill first: a client cleanup waits for a process that ignores EOF
+        # and can't signal it (another uid), so it would hang. Kill again
+        # after the cleanup in case anything restarted meanwhile.
+        if not await self.stop_server_processes(server_id):
+            raise RuntimeError(f"processes of server {server_id} survived")
+        if self.current_config:
+            self.current_config.get("mcpServers", {}).pop(server_id, None)
     
     def _unmount_server(self, server_id: str):
         """Unmount a server from FastAPI routes"""
@@ -362,12 +449,11 @@ class MCPHotReloader:
     async def _start_server(self, server_id: str, config: Dict[str, Any]):
         """Start a specific MCP server"""
         try:
-            logger.info(f"Starting MCP server {server_id} with config: {config}")
+            logger.info(f"Starting MCP server {server_id} ({describe_server_config(config)})")
             
-            # Create a new sub-app for this server
+            # Create a new sub-app for this server. CORS and the API key come
+            # from the main app's middleware, which also wraps mounted apps.
             from fastapi import FastAPI
-            from fastapi.middleware.cors import CORSMiddleware
-            import os
             
             # Import lifespan from main module
             from .main import lifespan
@@ -379,22 +465,14 @@ class MCPHotReloader:
                 lifespan=lifespan,
             )
             
-            # Configure CORS
-            sub_app.add_middleware(
-                CORSMiddleware,
-                allow_origins=["*"],
-                allow_credentials=True,
-                allow_methods=["*"],
-                allow_headers=["*"],
-            )
-            
             # Configure server based on type
             if config.get("command"):
                 # stdio server
                 sub_app.state.server_type = "stdio"
                 sub_app.state.command = config["command"]
                 sub_app.state.args = config.get("args", [])
-                sub_app.state.env = {**os.environ, **config.get("env", {})}
+                sub_app.state.env = stdio_environment(config.get("env"))
+                sub_app.state.server_id = server_id
             elif config.get("type") == "sse" and config.get("url"):
                 # SSE server
                 sub_app.state.server_type = "sse"
@@ -410,6 +488,8 @@ class MCPHotReloader:
                 sub_app.state.server_type = "sse"
                 sub_app.state.args = config["url"]
             
+            sub_app.state.headers = config.get("headers")
+
             # Get API dependency from main app
             api_dependency = getattr(self.app.state, "api_dependency", None)
             sub_app.state.api_dependency = api_dependency
@@ -518,6 +598,8 @@ class MCPHotReloader:
             if not hasattr(self.app.state, 'connection_tasks'):
                 self.app.state.connection_tasks = []
             self.app.state.connection_tasks.append(task)
+            from .main import register_server_task
+            register_server_task(self.app, server_id, task)
             
             logger.info(f"✅ Started maintenance task for server: {server_id}")
             
@@ -535,10 +617,14 @@ class MCPHotReloader:
             if not url:
                 raise Exception(f"No SSE URL configured for server {server_id}")
             
-            logger.info(f"🔗 Establishing SSE connection to: {url}")
+            logger.info(f"🔗 Establishing SSE connection to: {loggable_url(url)}")
             
             # Create the SSE client connection
-            sub_app.state._sse_client = sse_client(url=url, sse_read_timeout=None)
+            sub_app.state._sse_client = sse_client(
+                url=url,
+                sse_read_timeout=None,
+                headers=getattr(sub_app.state, "headers", None) or None,
+            )
             sub_app.state._reader, sub_app.state._writer = await sub_app.state._sse_client.__aenter__()
             
             # Create and initialize the session
@@ -565,11 +651,12 @@ class MCPHotReloader:
             if not command:
                 raise Exception(f"No command configured for server {server_id}")
             
-            logger.info(f"🔗 Establishing stdio connection: {command} {' '.join(args)}")
+            logger.info(f"🔗 Establishing stdio connection: {command} ({len(args)} args)")
             
+            wrapped_command, wrapped_args = stdio_command(command, args, server_id=server_id)
             server_params = StdioServerParameters(
-                command=command,
-                args=args,
+                command=wrapped_command,
+                args=wrapped_args,
                 env={**env}
             )
             
@@ -597,10 +684,12 @@ class MCPHotReloader:
             if not url:
                 raise Exception(f"No HTTP URL configured for server {server_id}")
             
-            logger.info(f"🔗 Establishing streamable HTTP connection to: {url}")
+            logger.info(f"🔗 Establishing streamable HTTP connection to: {loggable_url(url)}")
             
             # Create the streamable HTTP client connection
-            sub_app.state._http_client = streamablehttp_client(url=url)
+            sub_app.state._http_client = streamablehttp_client(
+                url=url, headers=getattr(sub_app.state, "headers", None) or None
+            )
             sub_app.state._reader, sub_app.state._writer, _ = await sub_app.state._http_client.__aenter__()
             
             # Create and initialize the session
@@ -625,6 +714,8 @@ class MCPHotReloader:
             if not hasattr(self.app.state, 'connection_tasks'):
                 self.app.state.connection_tasks = []
             self.app.state.connection_tasks.append(task)
+            from .main import register_server_task
+            register_server_task(self.app, server_id, task)
             
             logger.info(f"✅ Started background connection task for server: {server_id}")
             
@@ -675,28 +766,20 @@ class MCPHotReloader:
             sub_app.state.connection_status = "failed"
     
     async def _cleanup_background_tasks(self, server_id: str):
-        """Clean up background connection tasks for a server"""
+        """Cancel this server's connection tasks (and so stop its process), and only its own."""
         try:
-            if hasattr(self.app.state, 'connection_tasks'):
-                # Note: In a more sophisticated implementation, we'd track tasks per server
-                # For now, we'll just ensure all tasks are properly managed
-                tasks_to_cancel = []
-                for task in self.app.state.connection_tasks:
-                    if not task.done():
-                        tasks_to_cancel.append(task)
-                
-                # Cancel tasks
-                for task in tasks_to_cancel:
-                    task.cancel()
-                
-                # Wait for cancellation to complete
-                if tasks_to_cancel:
-                    await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
-                
-                logger.info(f"✅ Cleaned up {len(tasks_to_cancel)} background tasks for server: {server_id}")
+            tasks = getattr(self.app.state, "server_tasks", {}).pop(server_id, [])
+            pending = [task for task in tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if hasattr(self.app.state, "connection_tasks"):
+                self.app.state.connection_tasks = [t for t in self.app.state.connection_tasks if t not in tasks]
+            logger.info(f"✅ Cleaned up {len(pending)} background tasks for server: {server_id}")
         except Exception as e:
             logger.error(f"❌ Failed to cleanup background tasks for {server_id}: {e}")
-    
+
     async def _verify_tools_or_force_reload(self, server_id: str, sub_app):
         """Verify tools are available or trigger force reload"""
         try:
@@ -840,7 +923,8 @@ def apply_hot_reload_patch(app, config_path: str):
                     healthy_servers += 1
                     
             except Exception as e:
-                server_statuses[server_id] = {"status": "error", "message": str(e)}
+                logger.error(f"Health check failed for {server_id}: {e}")
+                server_statuses[server_id] = {"status": "error", "message": "health check failed"}
         
         health_ratio = healthy_servers / total_servers if total_servers > 0 else 1.0
         

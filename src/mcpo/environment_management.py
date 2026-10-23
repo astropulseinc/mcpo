@@ -13,6 +13,8 @@ import base64
 
 logger = logging.getLogger(__name__)
 
+INTERNAL_ERROR = "Internal error; see the nova-proxy logs"
+
 ENV_CONFIG_PATH = os.environ.get("NOVA_ENV_CONFIG_PATH", "/opt/nova/environment.json")
 
 def load_environment_config() -> Dict[str, Any]:
@@ -64,7 +66,7 @@ def store_environment_variable(key: str, value: str, scope: str = "global",
         
     except Exception as e:
         logger.error(f"Failed to store environment variable {key}: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def get_environment_variable(key: str, scope: str = "global", 
                            server_id: Optional[str] = None) -> Optional[str]:
@@ -89,10 +91,9 @@ def get_environment_variable(key: str, scope: str = "global",
         logger.error(f"Failed to get environment variable {key}: {e}")
         return None
 
-def list_environment_variables(scope: str = "global", 
-                             server_id: Optional[str] = None, 
-                             show_values: bool = False) -> Dict[str, Any]:
-    """List environment variables"""
+def list_environment_variables(scope: str = "global",
+                             server_id: Optional[str] = None) -> Dict[str, Any]:
+    """List environment variables; sensitive values are always masked"""
     try:
         config = load_environment_config()
         variables = []
@@ -107,9 +108,7 @@ def list_environment_variables(scope: str = "global",
                 continue
             
             value = var_data["value"]
-            if show_values and var_data.get("sensitive", True):
-                value = simple_decrypt(value)
-            elif not show_values and var_data.get("sensitive", True):
+            if var_data.get("sensitive", True):
                 value = "***HIDDEN***"
             
             variables.append({
@@ -124,7 +123,7 @@ def list_environment_variables(scope: str = "global",
         
     except Exception as e:
         logger.error(f"Failed to list environment variables: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def delete_environment_variable(key: str, scope: str = "global", 
                               server_id: Optional[str] = None) -> Dict[str, Any]:
@@ -143,7 +142,7 @@ def delete_environment_variable(key: str, scope: str = "global",
             
     except Exception as e:
         logger.error(f"Failed to delete environment variable {key}: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def get_variable_templates() -> Dict[str, Any]:
     """Get predefined variable templates"""
@@ -233,7 +232,7 @@ def validate_variable(key: str, value: str) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Failed to validate variable {key}: {e}")
-        return {"valid": False, "message": f"Validation failed: {str(e)}"}
+        return {"valid": False, "message": "Validation failed"}
 
 def apply_environment_patch(app):
     """Add environment management endpoints to the app"""
@@ -254,10 +253,9 @@ def apply_environment_patch(app):
     async def list_env_variables(
         scope: str = Query("global"),
         server_id: Optional[str] = Query(None),
-        show_values: bool = Query(False)
     ):
-        """List environment variables"""
-        result = list_environment_variables(scope, server_id, show_values)
+        """List environment variables (sensitive values are masked)"""
+        result = list_environment_variables(scope, server_id)
         if result["success"]:
             return result  # Return full result object with variables array
         else:
