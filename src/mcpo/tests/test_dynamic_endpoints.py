@@ -1,6 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -114,3 +115,23 @@ def test_after_a_reconnect_the_new_schema_is_the_one_validated():
 
     assert client.post("/echo", json={"new": "x"}).status_code == 200
     assert client.post("/echo", json={"old": "x"}).status_code == 422
+
+
+def test_a_failed_re_registration_keeps_the_old_routes(monkeypatch):
+    import mcpo.main
+
+    app = FastAPI()
+    app.state.session = FakeSession([make_tool("echo")])
+    asyncio.run(create_dynamic_endpoints(app))
+
+    def broken(*_args, **_kwargs):
+        raise ValueError("bad schema")
+
+    monkeypatch.setattr(mcpo.main, "get_model_fields", broken)
+    app.state.session = FakeSession([make_tool("echo"), make_tool("shout")])
+    with pytest.raises(ValueError):
+        asyncio.run(create_dynamic_endpoints(app))
+
+    posts = [r.path for r in app.routes if "POST" in getattr(r, "methods", set())]
+    assert posts == ["/echo"]
+    assert TestClient(app).post("/echo", json={"value": "x"}).status_code == 200

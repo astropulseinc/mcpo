@@ -6,7 +6,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Optional
 
 import uvicorn
-from fastapi import Depends, FastAPI
+from fastapi import APIRouter, Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
@@ -39,11 +39,11 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
     tools_result = await session.list_tools()
     tools = tools_result.tools
 
-    # A reconnect re-registers the server's tools: drop the routes from the
-    # previous registration so each tool has exactly one, with the new schema.
-    previous = {id(route) for route in getattr(app.state, "tool_routes", [])}
-    app.router.routes[:] = [route for route in app.router.routes if id(route) not in previous]
-    count_before = len(app.router.routes)
+    # Build the new routes on a scratch router first; only when every tool
+    # built do they replace the previous registration's routes (a reconnect
+    # re-registers), so each tool has exactly one route with the new schema
+    # and a failure leaves the old routes serving.
+    scratch = APIRouter()
 
     for tool in tools:
         endpoint_name = tool.name
@@ -74,7 +74,7 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
             response_model_fields,
         )
 
-        app.post(
+        scratch.post(
             f"/{endpoint_name}",
             summary=endpoint_name.replace("_", " ").title(),
             description=endpoint_description,
@@ -82,7 +82,9 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
             dependencies=[Depends(api_dependency)] if api_dependency else [],
         )(tool_handler)
 
-    app.state.tool_routes = list(app.router.routes[count_before:])
+    previous = {id(route) for route in getattr(app.state, "tool_routes", [])}
+    app.router.routes[:] = [route for route in app.router.routes if id(route) not in previous] + scratch.routes
+    app.state.tool_routes = list(scratch.routes)
 
     # FastAPI caches the OpenAPI document on first request; drop it so a
     # fetch made before (re)registration doesn't hide these tools.
