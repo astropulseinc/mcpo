@@ -307,3 +307,53 @@ def test_reloading_a_server_that_no_longer_validates_keeps_it(stores):
 
     assert response.status_code >= 400
     assert json.loads(stores.read_text())["mcpServers"]["memory"] == stored
+
+
+# --- cross-site requests -----------------------------------------------------
+
+
+def basic(key=API_KEY):
+    return {"Authorization": "Basic " + base64.b64encode(f"operator:{key}".encode()).decode()}
+
+
+def test_basic_auth_changes_need_a_custom_header(stores):
+    client = TestClient(build(stores))
+
+    refused = client.post("/api/marketplace/install/memory", headers=basic())
+    allowed = client.post("/api/marketplace/install/memory", headers={**basic(), "X-Requested-With": "nova-proxy-ui"})
+
+    assert refused.status_code == 403
+    assert allowed.status_code != 403
+
+
+def test_bearer_changes_need_no_custom_header(stores):
+    client = TestClient(build(stores))
+
+    assert client.post("/api/marketplace/install/memory", headers=bearer()).status_code != 403
+
+
+def test_basic_auth_reads_need_no_custom_header(stores):
+    assert TestClient(build(stores)).get("/api/mcp/servers", headers=basic()).status_code == 200
+
+
+def test_reload_is_not_a_get(stores):
+    client = TestClient(build(stores))
+    headers = {**bearer()}
+
+    assert client.get("/api/mcp/servers/reload", headers=headers).status_code in (404, 405)
+    assert client.get("/api/mcp/servers/reload?force=true", headers=headers).status_code in (404, 405)
+
+
+def test_reload_is_a_post(stores, monkeypatch):
+    monkeypatch.setattr(mcp_management, "reload_mcp_servers", lambda **_kw: {"success": True, "message": "ok"})
+
+    response = TestClient(build(stores)).post("/api/mcp/servers/reload", headers=bearer())
+
+    assert response.status_code == 200
+
+
+def test_reload_is_a_reserved_server_id(stores):
+    response = management_app().post("/api/mcp/servers/reload", json={"type": "sse", "url": "http://a/"})
+
+    assert "reload" not in json.loads(stores.read_text())["mcpServers"]
+    assert response.status_code != 200 or "added" not in response.text

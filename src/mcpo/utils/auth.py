@@ -19,6 +19,9 @@ ALGORITHM = "HS256"
 
 bearer_security = HTTPBearer(auto_error=False)
 
+SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+CSRF_HEADER = "X-Requested-With"
+
 # Basic first, so a browser opening the UI prompts for the key as the password.
 WWW_AUTHENTICATE = 'Basic realm="mcpo", Bearer'
 
@@ -94,6 +97,14 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                     if not key_matches(password, self.api_key):
                         return JSONResponse(
                             status_code=403, content={"detail": "Invalid credentials"}
+                        )
+                    # A browser sends cached Basic credentials on cross-site
+                    # requests too; a custom header cannot be added cross-site
+                    # without a CORS preflight, so changes must carry one.
+                    if request.method not in SAFE_METHODS and not request.headers.get(CSRF_HEADER):
+                        return JSONResponse(
+                            status_code=403,
+                            content={"detail": f"Changes with Basic auth need the {CSRF_HEADER} header"},
                         )
                 except Exception:
                     return JSONResponse(

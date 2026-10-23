@@ -98,6 +98,7 @@ def load_marketplace_templates() -> Dict[str, Any]:
         return {}
 
 
+RESERVED_SERVER_IDS = {"reload", "api", "static", "docs", "openapi.json"}
 SERVER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _PLACEHOLDER_PATTERN = re.compile(r"^\{\{[A-Za-z0-9_]+\}\}$")
 
@@ -136,6 +137,8 @@ def validate_server_config(server_id: str, config: dict[str, Any]) -> str | None
     """Return why a server config may not be stored, or None when it may."""
     if not SERVER_ID_PATTERN.match(server_id or ""):
         return "Server id may contain only letters, digits, '-' and '_' (at most 64)"
+    if server_id in RESERVED_SERVER_IDS:
+        return f"Server id '{server_id}' is reserved"
     if config.get("command") and find_verified_template(config, load_marketplace_templates()) is None:
         return "A command server must match a verified marketplace template (command, arguments and environment keys)"
     return None
@@ -757,7 +760,7 @@ def apply_monkey_patch(app):
         else:
             raise HTTPException(status_code=500, detail=result["error"])
     
-    @app.get("/api/mcp/servers/reload")
+    @app.post("/api/mcp/servers/reload")
     async def reload_servers(force: bool = Query(False)):
         """Reload all MCP servers. If force=true, kills process (Docker restarts it)"""
         if force:
