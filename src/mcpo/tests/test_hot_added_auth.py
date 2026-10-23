@@ -1,7 +1,7 @@
-import pytest
 import asyncio
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from mcpo import mcp_management
