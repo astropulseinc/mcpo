@@ -39,6 +39,12 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
     tools_result = await session.list_tools()
     tools = tools_result.tools
 
+    # A reconnect re-registers the server's tools: drop the routes from the
+    # previous registration so each tool has exactly one, with the new schema.
+    previous = {id(route) for route in getattr(app.state, "tool_routes", [])}
+    app.router.routes[:] = [route for route in app.router.routes if id(route) not in previous]
+    count_before = len(app.router.routes)
+
     for tool in tools:
         endpoint_name = tool.name
         endpoint_description = tool.description
@@ -75,6 +81,8 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
             response_model_exclude_none=True,
             dependencies=[Depends(api_dependency)] if api_dependency else [],
         )(tool_handler)
+
+    app.state.tool_routes = list(app.router.routes[count_before:])
 
     # FastAPI caches the OpenAPI document on first request; drop it so a
     # fetch made before (re)registration doesn't hide these tools.

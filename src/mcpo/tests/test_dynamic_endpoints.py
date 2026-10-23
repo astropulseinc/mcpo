@@ -85,3 +85,32 @@ def test_openapi_reflects_a_changed_tool_list():
     asyncio.run(create_dynamic_endpoints(app))
 
     assert "/shout" in client.get("/openapi.json").json()["paths"]
+
+
+def echo_tool(required_field):
+    tool = make_tool("echo")
+    tool.inputSchema = {"type": "object", "properties": {required_field: {"type": "string"}}, "required": [required_field]}
+    return tool
+
+
+def test_reconnects_replace_routes_instead_of_adding_them():
+    app = FastAPI()
+    for _ in range(5):
+        app.state.session = FakeSession([make_tool("echo"), make_tool("shout")])
+        asyncio.run(create_dynamic_endpoints(app))
+
+    tool_routes = [r.path for r in app.routes if "POST" in getattr(r, "methods", set())]
+    assert sorted(tool_routes) == ["/echo", "/shout"]
+
+
+def test_after_a_reconnect_the_new_schema_is_the_one_validated():
+    app = FastAPI()
+    app.state.session = FakeSession([echo_tool("old")])
+    asyncio.run(create_dynamic_endpoints(app))
+    session = FakeSession([echo_tool("new")])
+    app.state.session = session
+    asyncio.run(create_dynamic_endpoints(app))
+    client = TestClient(app)
+
+    assert client.post("/echo", json={"new": "x"}).status_code == 200
+    assert client.post("/echo", json={"old": "x"}).status_code == 422
