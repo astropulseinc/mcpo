@@ -179,12 +179,18 @@ def describe_server_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _restore_masked_secrets(config: dict[str, Any], stored: dict[str, Any] | None) -> None:
-    """Put stored values back where a client sent the mask it was shown."""
+    """Put stored values back where a client sent the mask it was shown.
+
+    Stored headers are kept only while the URL is unchanged, so a masked
+    bearer token is never sent to a new destination.
+    """
     for field in _SECRET_FIELDS:
         submitted = config.get(field)
         if not isinstance(submitted, dict):
             continue
         previous = (stored or {}).get(field) or {}
+        if field == "headers" and config.get("url") != (stored or {}).get("url"):
+            previous = {}
         config[field] = {
             name: (previous[name] if value == SECRET_MASK else value)
             for name, value in submitted.items()
@@ -715,7 +721,8 @@ def apply_monkey_patch(app):
         command: str = None
         args: List[str] = None
         env: Dict[str, str] = None
-    
+        headers: Dict[str, str] = None
+
     class ServerToggleRequest(BaseModel):
         enabled: bool
     

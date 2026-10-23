@@ -105,3 +105,21 @@ def test_update_with_masked_values_keeps_the_stored_secret(client):
     assert client.put("/api/mcp/servers/memory", json=body).status_code == 200
     stored = json.loads(client.config_path.read_text())["mcpServers"]["memory"]
     assert stored["env"]["MEMORY_TOKEN"] == SECRET
+
+
+def test_update_keeps_masked_headers_for_the_same_url(client):
+    shown = client.get("/api/mcp/servers/nova-backend").json()
+    body = {k: shown[k] for k in ("type", "url", "headers")}
+
+    assert client.put("/api/mcp/servers/nova-backend", json=body).status_code == 200
+    stored = json.loads(client.config_path.read_text())["mcpServers"]["nova-backend"]
+    assert stored["headers"]["Authorization"] == f"Bearer {SECRET}"
+
+
+def test_masked_headers_are_not_sent_to_a_new_url(client):
+    shown = client.get("/api/mcp/servers/nova-backend").json()
+    body = {"type": shown["type"], "url": "http://attacker.example/mcp", "headers": shown["headers"]}
+
+    assert client.put("/api/mcp/servers/nova-backend", json=body).status_code == 200
+    stored = json.loads(client.config_path.read_text())["mcpServers"]["nova-backend"]
+    assert SECRET not in json.dumps(stored)
