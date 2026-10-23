@@ -371,6 +371,8 @@ def build_app(
         main_app.state.api_dependency = api_dependency
     elif config_path:
         logger.info(f"Loading MCP server configurations from: {config_path}")
+        # Hot reload copies this onto servers added at runtime.
+        main_app.state.api_dependency = api_dependency
         with open(config_path, "r") as f:
             config_data = json.load(f)
 
