@@ -159,6 +159,23 @@ def redact_secrets(value: Any) -> Any:
     return value
 
 
+def describe_server_config(config: dict[str, Any]) -> dict[str, Any]:
+    """A loggable summary of a server config: no args, env or header values."""
+    from urllib.parse import urlsplit
+
+    summary: dict[str, Any] = {"type": config.get("type")}
+    if config.get("command"):
+        summary["command"] = config["command"]
+        summary["args"] = len(config.get("args") or [])
+    if config.get("url"):
+        parts = urlsplit(str(config["url"]))
+        summary["url"] = f"{parts.scheme}://{parts.hostname or ''}{f':{parts.port}' if parts.port else ''}{parts.path}"
+    for field in _SECRET_FIELDS:
+        if isinstance(config.get(field), dict):
+            summary[field] = sorted(config[field])
+    return summary
+
+
 def _restore_masked_secrets(config: dict[str, Any], stored: dict[str, Any] | None) -> None:
     """Put stored values back where a client sent the mask it was shown."""
     for field in _SECRET_FIELDS:

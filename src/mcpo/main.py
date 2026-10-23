@@ -362,7 +362,7 @@ def build_app(
         main_app.state.api_dependency = api_dependency
     elif server_command:  # This handles stdio
         logger.info(
-            f"Configuring for a single Stdio MCP Server with command: {' '.join(server_command)}"
+            f"Configuring for a single Stdio MCP Server with command: {server_command[0]}"
         )
         main_app.state.server_type = "stdio"  # Explicitly set type
         main_app.state.command = server_command[0]
@@ -384,13 +384,8 @@ def build_app(
         logger.info("Configured MCP Servers:")
         for server_name_cfg, server_cfg_details in mcp_servers.items():
             if server_cfg_details.get("command"):
-                args_info = (
-                    f" with args: {server_cfg_details['args']}"
-                    if server_cfg_details.get("args")
-                    else ""
-                )
                 logger.info(
-                    f"  Configuring Stdio MCP Server '{server_name_cfg}' with command: {server_cfg_details['command']}{args_info}"
+                    f"  Configuring Stdio MCP Server '{server_name_cfg}' with command: {server_cfg_details['command']}"
                 )
             elif server_cfg_details.get("type") == "sse" and server_cfg_details.get(
                 "url"

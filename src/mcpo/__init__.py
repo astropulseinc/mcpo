@@ -97,7 +97,7 @@ def main(
         print("Starting MCP OpenAPI Proxy with config file:", config_path)
     else:
         print(
-            f"Starting MCP OpenAPI Proxy on {host}:{port} with command: {' '.join(server_command)}"
+            f"Starting MCP OpenAPI Proxy on {host}:{port} with command: {server_command[0]}"
         )
 
     try:

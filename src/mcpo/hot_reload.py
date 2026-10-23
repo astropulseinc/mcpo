@@ -22,6 +22,8 @@ except ImportError:
     FileSystemEventHandler = None
     FileModifiedEvent = None
 
+from .mcp_management import describe_server_config
+
 logger = logging.getLogger(__name__)
 
 if WATCHDOG_AVAILABLE:
@@ -264,7 +266,7 @@ class MCPHotReloader:
             # Start added/modified servers
             for server_id in added | modified:
                 server_config = new_config["mcpServers"][server_id]
-                logger.info(f"🚀 Starting server: {server_id} with config: {server_config}")
+                logger.info(f"🚀 Starting server: {server_id} ({describe_server_config(server_config)})")
                 await self._start_server(server_id, server_config)
             
             self.current_config = new_config
@@ -362,7 +364,7 @@ class MCPHotReloader:
     async def _start_server(self, server_id: str, config: Dict[str, Any]):
         """Start a specific MCP server"""
         try:
-            logger.info(f"Starting MCP server {server_id} with config: {config}")
+            logger.info(f"Starting MCP server {server_id} ({describe_server_config(config)})")
             
             # Create a new sub-app for this server. CORS and the API key come
             # from the main app's middleware, which also wraps mounted apps.
@@ -562,7 +564,7 @@ class MCPHotReloader:
             if not command:
                 raise Exception(f"No command configured for server {server_id}")
             
-            logger.info(f"🔗 Establishing stdio connection: {command} {' '.join(args)}")
+            logger.info(f"🔗 Establishing stdio connection: {command} ({len(args)} args)")
             
             server_params = StdioServerParameters(
                 command=command,
