@@ -25,6 +25,7 @@ except ImportError:
 from .mcp_management import (
     describe_server_config,
     loggable_url,
+    retire_stdio_uid,
     stdio_command,
     stdio_environment,
 )
@@ -267,6 +268,10 @@ class MCPHotReloader:
             for server_id in removed | modified:
                 logger.info(f"🛑 Stopping server: {server_id}")
                 await self._stop_server(server_id)
+            # A removed server's uid is retired after its process stopped,
+            # so a server added later under this id gets a fresh home.
+            for server_id in removed:
+                retire_stdio_uid(server_id)
             
             # Start added/modified servers
             for server_id in added | modified:

@@ -223,3 +223,79 @@ def test_a_wrapper_with_uid_needs_a_pool(monkeypatch):
 
     with pytest.raises(ValueError, match="MCPO_STDIO_UID_POOL"):
         mcp_management.stdio_command("npx", ["pkg"], server_id="a")
+
+
+def write_marker(base, uid, server_id, package):
+    base.mkdir(exist_ok=True)
+    (base / f"{uid}.owner").write_text(f"{server_id}\n{package}\n")
+
+
+@pytest.fixture
+def home_base(uid_pool, tmp_path, monkeypatch):
+    base = tmp_path / "nova-tools"
+    base.mkdir()
+    monkeypatch.setenv("MCPO_STDIO_HOME_BASE", str(base))
+    monkeypatch.setattr(mcp_management, "_uid_hash", lambda _server_id: 7)
+    return base
+
+
+def test_a_lost_map_never_reuses_a_home_for_a_different_package(home_base, uid_pool):
+    write_marker(home_base, 20007, "a", "npx pkg-one")
+
+    assert mcp_management.stdio_uid("a", "npx pkg-two") != 20007
+
+
+def test_a_lost_map_reuses_the_home_of_the_same_server_and_package(home_base, uid_pool):
+    write_marker(home_base, 20007, "a", "npx pkg-one")
+
+    assert mcp_management.stdio_uid("a", "npx pkg-one") == 20007
+
+
+def test_a_uid_marked_for_another_server_is_skipped(home_base, uid_pool):
+    write_marker(home_base, 20007, "x", "npx p")
+
+    assert mcp_management.stdio_uid("b", "npx p") == 20008
+
+
+def test_the_package_reaches_the_wrapper(uid_pool, monkeypatch):
+    monkeypatch.setenv("MCPO_STDIO_WRAPPER", json.dumps(["/launcher", "--uid={uid}", "--package={package}", "--"]))
+
+    _, args = mcp_management.stdio_command("npx", ["-y", "pkg-a@1"], server_id="a")
+
+    assert args[1] == "--package=npx pkg-a@1"
+
+
+def test_the_map_is_written_through_a_unique_synced_temp_file(uid_pool, monkeypatch):
+    synced = []
+    real_fsync = mcp_management.os.fsync
+    monkeypatch.setattr(mcp_management.os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd)))
+
+    mcp_management.stdio_uid("a", "npx pkg")
+
+    assert synced
+    assert sorted(p.name for p in uid_pool.parent.iterdir() if "stdio_uids" in p.name) == ["stdio_uids.json"]
+
+
+def test_an_exhausted_pool_names_the_operator_step(uid_pool, monkeypatch):
+    monkeypatch.setenv("MCPO_STDIO_UID_POOL", "20000:1")
+    mcp_management.stdio_uid("a", "npx pkg")
+
+    with pytest.raises(ValueError, match="retired") as raised:
+        mcp_management.stdio_uid("b", "npx pkg")
+    assert "MCPO_STDIO_UID_POOL" in str(raised.value)
+
+
+def test_hot_reload_removal_retires_the_uid(uid_pool, tmp_path, monkeypatch):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"mcpServers": {}}))
+    reloader = MCPHotReloader(FastAPI(), str(path))
+    reloader.current_config = {"mcpServers": {"a": SERVER}}
+    uid = mcp_management.stdio_uid("a", "npx pkg")
+
+    async def stopped(_server_id):
+        return None
+
+    monkeypatch.setattr(reloader, "_stop_server", stopped)
+    asyncio.run(reloader._reload_servers())
+
+    assert uid in json.loads(uid_pool.read_text())["retired"]

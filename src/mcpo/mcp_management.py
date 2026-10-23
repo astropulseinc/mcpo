@@ -243,15 +243,41 @@ def _load_uid_map() -> dict[str, Any]:
 
 
 def _save_uid_map(data: dict[str, Any]) -> None:
+    """Write the map crash-safely: a unique owner-only temp file, synced, then renamed."""
     path = os.environ.get("MCPO_STDIO_UID_MAP")
     if not path:
         return
-    tmp = f"{path}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".stdio_uids.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _home_marker(uid: int) -> tuple[str, str] | None:
+    """(server id, package) from the launcher's <uid>.owner marker, if the uid was ever used."""
+    base = os.environ.get("MCPO_STDIO_HOME_BASE")
+    if not base:
+        return None
+    try:
+        with open(os.path.join(base, f"{uid}.owner"), "r", encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except FileNotFoundError:
+        return None
+    return (lines[0] if lines else "", lines[1] if len(lines) > 1 else "")
 
 
 def stdio_package(command: str, args: list[str]) -> str:
@@ -265,8 +291,11 @@ def stdio_uid(server_id: str, package: str | None = None) -> int:
 
     An id keeps its uid (persisted in MCPO_STDIO_UID_MAP, owner-only), and no
     other id ever gets it: a taken uid is skipped by probing to the next free
-    one, and the uid of a deleted server is retired, never reassigned. An id
-    whose package changed gets a fresh uid (and so a fresh home).
+    one, and the uid of a removed server is retired, never reassigned. An id
+    whose package changed gets a fresh uid (and so a fresh home). The
+    launcher's home markers (MCPO_STDIO_HOME_BASE) also count: a uid whose
+    marker names another server or package is never handed out, even if
+    the map was lost.
     """
     first, count = _uid_pool()
     data = _load_uid_map()
@@ -283,12 +312,24 @@ def stdio_uid(server_id: str, package: str | None = None) -> int:
     else:
         taken = {item["uid"] for item in assigned.values()} | set(retired)
         start = _uid_hash(server_id) % count
+
+        def free(candidate: int) -> bool:
+            if candidate in taken:
+                return False
+            marker = _home_marker(candidate)
+            return marker is None or marker == (server_id, package or "")
+
         uid = next(
-            (first + (start + step) % count for step in range(count) if first + (start + step) % count not in taken),
+            (first + (start + step) % count for step in range(count) if free(first + (start + step) % count)),
             None,
         )
         if uid is None:
-            raise ValueError(f"stdio uid pool {first}:{count} is exhausted; no uid for {server_id}")
+            raise ValueError(
+                f"stdio uid pool {first}:{count} is exhausted; no uid for {server_id}. "
+                "Every uid is assigned or retired. Remove the homes and <uid>.owner markers of servers "
+                "you no longer need under the tool home directory, drop those uids from 'retired' in "
+                "MCPO_STDIO_UID_MAP, or widen MCPO_STDIO_UID_POOL."
+            )
         assigned[server_id] = {"uid": uid, "package": package}
     _save_uid_map(data)
     return uid
@@ -319,7 +360,8 @@ def stdio_command(command: str, args: list[str], server_id: str = "default") -> 
     if any("{uid}" in part for part in wrapper):
         uid = str(stdio_uid(server_id, stdio_package(command, args)))
         wrapper = [part.replace("{uid}", uid) for part in wrapper]
-    wrapper = [part.replace("{server_id}", server_id) for part in wrapper]
+    package = stdio_package(command, args)
+    wrapper = [part.replace("{server_id}", server_id).replace("{package}", package) for part in wrapper]
     return wrapper[0], [*wrapper[1:], command, *args]
 
 
