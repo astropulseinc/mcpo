@@ -3,11 +3,10 @@ import json
 import logging
 from contextlib import asynccontextmanager
 
-import mcpo.main
-
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import mcpo.main
 from mcpo import mcp_management
 from mcpo.hot_reload import MCPHotReloader
 from mcpo.main import build_app, create_dynamic_endpoints
