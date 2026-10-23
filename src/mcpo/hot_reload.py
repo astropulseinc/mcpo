@@ -24,6 +24,7 @@ except ImportError:
 
 from .mcp_management import (
     describe_server_config,
+    kill_stdio_processes,
     loggable_url,
     retire_stdio_uid,
     stdio_command,
@@ -265,12 +266,18 @@ class MCPHotReloader:
                 return
             
             # Stop removed/modified servers
+            survivors = set()
             for server_id in removed | modified:
                 logger.info(f"🛑 Stopping server: {server_id}")
                 await self._stop_server(server_id)
-            # A removed server's uid is retired after its process stopped,
+                try:
+                    await kill_stdio_processes(server_id)
+                except RuntimeError as e:
+                    logger.error(f"❌ {e}; its uid stays assigned")
+                    survivors.add(server_id)
+            # A removed server's uid is retired after its processes are gone,
             # so a server added later under this id gets a fresh home.
-            for server_id in removed:
+            for server_id in removed - survivors:
                 retire_stdio_uid(server_id)
             
             # Start added/modified servers
@@ -361,8 +368,12 @@ class MCPHotReloader:
             logger.error(f"Failed to stop server {server_id}: {e}")
 
     async def stop_server(self, server_id: str):
-        """Stop a server now, whether it started at boot or by hot reload."""
+        """Stop a server now, whether it started at boot or by hot reload.
+
+        Raises RuntimeError when processes of its uid survive.
+        """
         await self._stop_server(server_id)
+        await kill_stdio_processes(server_id)
         if self.current_config:
             self.current_config.get("mcpServers", {}).pop(server_id, None)
     

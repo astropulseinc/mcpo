@@ -107,3 +107,61 @@ def test_delete_stops_the_process_before_retiring_its_uid(tmp_path, monkeypatch)
     assert seen["status"] == 200
     assert order == [("stopped", "one"), ("retired", "one")]
     assert ("stop", "pkg-one") in events
+
+
+def kill_setup(tmp_path, monkeypatch, survivors):
+    record = tmp_path / "killed"
+    monkeypatch.setenv("MCPO_STDIO_KILL_COMMAND", json.dumps(["sh", "-c", f"echo {{uid}} >> {record}"]))
+    monkeypatch.setenv("MCPO_STDIO_UID_POOL", "20000:10000")
+    monkeypatch.setenv("MCPO_STDIO_UID_MAP", str(tmp_path / "uids.json"))
+    monkeypatch.setattr(mcp_management, "processes_of_uid", lambda uid: list(survivors))
+    return record
+
+
+def test_stopping_a_server_kills_every_process_of_its_uid(tmp_path, monkeypatch):
+    record = kill_setup(tmp_path, monkeypatch, survivors=[])
+    uid = mcp_management.stdio_uid("one", "npx pkg-one")
+
+    async def scenario(app, events):
+        await app.state.hot_reloader.stop_server("one")
+
+    run_startup(tmp_path, monkeypatch, scenario)
+
+    assert record.read_text().split() == [str(uid)]
+
+
+def test_a_delete_that_cannot_stop_the_processes_changes_nothing(tmp_path, monkeypatch):
+    from fastapi import FastAPI
+
+    kill_setup(tmp_path, monkeypatch, survivors=[4242])
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"mcpServers": SERVERS}))
+    monkeypatch.setattr(mcp_management, "CONFIG_PATH", str(config))
+    monkeypatch.setattr(mcp_management, "MARKETPLACE_CONFIG_PATH", str(tmp_path / "m.json"))
+    uid = mcp_management.stdio_uid("one", "npx pkg-one")
+
+    class Reloader:
+        async def stop_server(self, server_id):
+            await mcp_management.kill_stdio_processes(server_id)
+
+    app = FastAPI()
+    mcp_management.apply_monkey_patch(app)
+    app.state.hot_reloader = Reloader()
+
+    from httpx import ASGITransport, AsyncClient
+
+    async def delete():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            return await client.delete("/api/mcp/servers/one")
+
+    response = asyncio.run(delete())
+
+    assert response.status_code == 500
+    assert "one" in json.loads(config.read_text())["mcpServers"]
+    assert uid not in json.loads((tmp_path / "uids.json").read_text())["retired"]
+
+
+def test_processes_of_uid_reads_proc():
+    import os
+
+    assert os.getpid() in mcp_management.processes_of_uid(os.getuid()) or not os.path.isdir("/proc")

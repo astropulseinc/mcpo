@@ -335,6 +335,60 @@ def stdio_uid(server_id: str, package: str | None = None) -> int:
     return uid
 
 
+def processes_of_uid(uid: int) -> list[int]:
+    """Pids of processes whose real uid is uid (from /proc; empty where there is none)."""
+    pids = []
+    try:
+        entries = os.listdir("/proc")
+    except FileNotFoundError:
+        return pids
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/status", "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("Uid:"):
+                        if int(line.split()[1]) == uid:
+                            pids.append(int(entry))
+                        break
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+    return pids
+
+
+async def kill_stdio_processes(server_id: str) -> None:
+    """Kill every process of a stdio server's uid, and check none remain.
+
+    The server may ignore stdin EOF and SIGTERM, or leave a setsid child; the
+    proxy can't signal another uid, so MCPO_STDIO_KILL_COMMAND (a JSON list,
+    "{uid}" substituted; e.g. the launcher's --kill-uid) does it as that uid.
+    Raises RuntimeError when processes survive.
+    """
+    import asyncio
+
+    command = json.loads(os.environ.get("MCPO_STDIO_KILL_COMMAND") or "[]")
+    entry = _load_uid_map()["assigned"].get(server_id)
+    if not command or not entry:
+        return
+    uid = entry["uid"]
+    argv = [part.replace("{uid}", str(uid)) for part in command]
+    if not await asyncio.to_thread(_kill_until_gone, argv, uid):
+        raise RuntimeError(f"processes of server {server_id} (uid {uid}) survived SIGKILL")
+
+
+def _kill_until_gone(argv: list[str], uid: int, attempts: int = 5) -> bool:
+    """Run the kill command until no process of uid remains; False if some survive."""
+    import subprocess
+
+    for _attempt in range(attempts):
+        subprocess.run(argv, check=False, timeout=10)
+        time.sleep(0.1)
+        if not processes_of_uid(uid):
+            return True
+    return False
+
+
 def retire_stdio_uid(server_id: str) -> None:
     """A deleted server's uid (and home) is never given to another server."""
     data = _load_uid_map()
@@ -1017,13 +1071,18 @@ def apply_monkey_patch(app):
     @app.delete("/api/mcp/servers/{server_id}")
     async def remove_server(server_id: str):
         """Remove MCP server"""
+        # Stop every process of the server first; only then remove it and
+        # retire its uid, so a server added later under this id starts with
+        # a fresh home.
+        reloader = getattr(app.state, "hot_reloader", None)
+        if reloader and server_id in load_config().get("mcpServers", {}):
+            try:
+                await reloader.stop_server(server_id)
+            except RuntimeError as e:
+                logger.error(f"Not removing {server_id}: {e}")
+                raise HTTPException(status_code=500, detail=f"Could not stop server {server_id}; nothing was removed")
         result = remove_mcp_server(server_id)
         if result["success"]:
-            # Stop the process first, then retire its uid: a server added
-            # later under this id starts with a fresh home.
-            reloader = getattr(app.state, "hot_reloader", None)
-            if reloader:
-                await reloader.stop_server(server_id)
             retire_stdio_uid(server_id)
             return {"message": result["message"]}
         else:
