@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 from mcpo.utils.main import get_model_fields, get_tool_handler
 from mcpo.utils.auth import get_verify_api_key, APIKeyMiddleware
+from mcpo import approvals
+from mcpo.approvals import approval_policy
 from mcpo.mcp_management import loggable_url, stdio_command, stdio_environment
 
 
@@ -72,6 +74,7 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
             endpoint_name,
             form_model_fields,
             response_model_fields,
+            approval_policy=approval_policy(tool),
         )
 
         scratch.post(
@@ -344,9 +347,14 @@ def build_app(
     # Added last so it runs first: preflights and 401s carry CORS headers.
     main_app.add_middleware(CORSMiddleware, **cors_options(cors_allow_origins))
 
+    # Writes wait for a person's approval, signed with a key derived from the
+    # management key (without one, a random key: nothing can then approve).
+    approvals.configure(approvals.derive_key(api_key) if api_key else None)
+
     # The management APIs start processes and edit server configs, so they
     # exist only behind an API key.
     if api_key:
+        main_app.include_router(approvals.management_router())
         try:
             logger.info("Adding Nova MCP Marketplace APIs...")
             from mcpo.mcp_management import apply_monkey_patch

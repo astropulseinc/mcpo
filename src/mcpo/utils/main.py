@@ -21,6 +21,7 @@ from mcp.shared.exceptions import McpError
 from pydantic import Field, create_model
 from pydantic.fields import FieldInfo
 
+from mcpo import approvals
 from mcpo.utils.headers import process_headers_for_server
 
 MCP_ERROR_TO_HTTP_STATUS = {
@@ -276,18 +277,66 @@ def get_model_fields(form_model_name, properties, required_fields, schema_defs=N
     return model_fields
 
 
+def untrusted(output: Any) -> dict:
+    """Tool output goes back to the model marked as data: instructions inside it are not followed."""
+    return {"untrusted_tool_output": output}
+
+
+async def call_tool_with_meta(session, name: str, arguments: Dict[str, Any], meta: Dict[str, Any]) -> CallToolResult:
+    """A tools/call that carries request _meta (ClientSession.call_tool cannot send it)."""
+    result = await session.send_request(
+        types.ClientRequest(
+            types.CallToolRequest(
+                params=types.CallToolRequestParams(
+                    name=name, arguments=arguments, _meta=types.RequestParams.Meta(**meta)
+                ),
+            )
+        ),
+        types.CallToolResult,
+    )
+    validate = getattr(session, "_validate_tool_result", None)
+    if validate and not result.isError:
+        await validate(name, result)
+    return result
+
+
+def hold_for_approval(endpoint_name: str, approval_policy, request: Request, args: Dict[str, Any]):
+    """The _meta that carries a person's approval of this call, or {} when it needs none.
+
+    Raises 428 (with a pending-approval id) when the call needs an approval it doesn't carry,
+    and 403 when the one it carries doesn't fit.
+    """
+    if approval_policy is None or not approval_policy.applies(args):
+        return {}
+    store = approvals.get_store()
+    user = request.headers.get(approvals.USER_HEADER, "")
+    token = request.headers.get(approvals.APPROVAL_HEADER)
+    if not token:
+        pending = store.hold(endpoint_name, request.url.path, args, user)
+        logger.info("Holding %s for approval (%s)", endpoint_name, pending.id)
+        raise HTTPException(status_code=428, detail=approvals.approval_required_detail(pending))
+    refused = store.redeem(token, endpoint_name, args, user)
+    if refused:
+        raise HTTPException(status_code=403, detail={"message": f"Not run: {refused}. Ask the user to approve it again."})
+    logger.info("Running %s with a person's approval", endpoint_name)
+    return {approvals.APPROVAL_META_KEY: token}
+
+
 def get_tool_handler(
     endpoint_name,
     form_model_fields,
     response_model_fields=None,
     client_header_forwarding_config=None,
+    approval_policy=None,
 ):
     async def call_tool_with_reconnect(
-        request: Request, arguments: Dict[str, Any]
+        request: Request, arguments: Dict[str, Any], call_meta: Optional[Dict[str, Any]] = None
     ) -> CallToolResult:
         session_manager = getattr(request.app.state, "session_manager", None)
 
         async def _invoke(session):
+            if call_meta:
+                return await call_tool_with_meta(session, endpoint_name, arguments, call_meta)
             return await session.call_tool(endpoint_name, arguments=arguments)
 
         if session_manager:
@@ -347,9 +396,11 @@ def get_tool_handler(
             if forwarded_headers:
                 meta["headers"] = forwarded_headers
 
+            call_meta = hold_for_approval(endpoint_name, approval_policy, request, args)
+
             logger.info(f"Calling endpoint: {endpoint_name}, with args: {sorted(args)}")
             try:
-                result = await call_tool_with_reconnect(request, args)
+                result = await call_tool_with_reconnect(request, args, call_meta)
 
                 if result.isError:
                     error_message = "Unknown tool execution error"
@@ -367,7 +418,7 @@ def get_tool_handler(
                 final_response = (
                     response_data[0] if len(response_data) == 1 else response_data
                 )
-                return final_response
+                return untrusted(final_response)
 
             except McpError as e:
                 logger.info(
@@ -407,9 +458,11 @@ def get_tool_handler(
         if forwarded_headers:
             meta["headers"] = forwarded_headers
 
+        call_meta = hold_for_approval(endpoint_name, approval_policy, request, {})
+
         logger.info(f"Calling endpoint: {endpoint_name}, with no args")
         try:
-            result = await call_tool_with_reconnect(request, {})
+            result = await call_tool_with_reconnect(request, {}, call_meta)
 
             if result.isError:
                 error_message = "Unknown tool execution error"
@@ -422,7 +475,7 @@ def get_tool_handler(
             final_response = (
                 response_data[0] if len(response_data) == 1 else response_data
             )
-            return final_response
+            return untrusted(final_response)
 
         except McpError as e:
             logger.info(
