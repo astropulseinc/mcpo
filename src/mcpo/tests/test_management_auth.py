@@ -352,7 +352,9 @@ def test_reload_is_a_post(stores, monkeypatch):
     assert response.status_code == 200
 
 
-def test_reload_is_a_reserved_server_id(stores):
+def test_reload_is_a_reserved_server_id(stores, monkeypatch):
+    # The real reload would re-exec this process (its no-hot-reload fallback).
+    monkeypatch.setattr(mcp_management, "reload_mcp_servers", lambda **_kw: {"success": True, "message": "ok"})
     response = management_app().post("/api/mcp/servers/reload", json={"type": "sse", "url": "http://a/"})
 
     assert "reload" not in json.loads(stores.read_text())["mcpServers"]
