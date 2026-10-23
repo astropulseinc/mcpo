@@ -335,25 +335,32 @@ def stdio_uid(server_id: str, package: str | None = None) -> int:
     return uid
 
 
+PROC_ROOT = "/proc"
+
+
 def processes_of_uid(uid: int) -> list[int]:
-    """Pids of processes whose real uid is uid (from /proc; empty where there is none)."""
+    """Pids of live processes whose real uid is uid (from /proc; empty where there is none).
+
+    Zombies don't count: they are dead and hold nothing; their parent (or
+    init) reaps them.
+    """
     pids = []
     try:
-        entries = os.listdir("/proc")
+        entries = os.listdir(PROC_ROOT)
     except FileNotFoundError:
         return pids
     for entry in entries:
         if not entry.isdigit():
             continue
         try:
-            with open(f"/proc/{entry}/status", "r", encoding="utf-8") as handle:
-                for line in handle:
-                    if line.startswith("Uid:"):
-                        if int(line.split()[1]) == uid:
-                            pids.append(int(entry))
-                        break
+            with open(f"{PROC_ROOT}/{entry}/status", "r", encoding="utf-8") as handle:
+                fields = dict(line.split(":", 1) for line in handle if ":" in line)
         except (FileNotFoundError, ProcessLookupError, PermissionError):
             continue
+        state = fields.get("State", "").strip()
+        real_uid = fields.get("Uid", "").split()
+        if real_uid and int(real_uid[0]) == uid and not state.startswith(("Z", "X")):
+            pids.append(int(entry))
     return pids
 
 

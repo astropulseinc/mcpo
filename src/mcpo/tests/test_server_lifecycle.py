@@ -127,7 +127,7 @@ def test_stopping_a_server_kills_every_process_of_its_uid(tmp_path, monkeypatch)
 
     run_startup(tmp_path, monkeypatch, scenario)
 
-    assert record.read_text().split() == [str(uid)]
+    assert set(record.read_text().split()) == {str(uid)}
 
 
 def test_a_delete_that_cannot_stop_the_processes_changes_nothing(tmp_path, monkeypatch):
@@ -165,3 +165,40 @@ def test_processes_of_uid_reads_proc():
     import os
 
     assert os.getpid() in mcp_management.processes_of_uid(os.getuid()) or not os.path.isdir("/proc")
+
+
+def test_processes_are_killed_before_the_client_cleanup_waits_for_them(tmp_path, monkeypatch):
+    order = []
+    kill_setup(tmp_path, monkeypatch, survivors=[])
+    mcp_management.stdio_uid("one", "npx pkg-one")
+
+    async def scenario(app, events):
+        reloader = app.state.hot_reloader
+        real_stop = reloader._stop_server
+
+        async def kill(server_id):
+            order.append("kill")
+
+        async def stop(server_id):
+            order.append("cleanup")
+            await real_stop(server_id)
+
+        import mcpo.hot_reload
+
+        monkeypatch.setattr(mcpo.hot_reload, "kill_stdio_processes", kill)
+        monkeypatch.setattr(reloader, "_stop_server", stop)
+        await reloader.stop_server("one")
+
+    run_startup(tmp_path, monkeypatch, scenario)
+
+    assert order[:2] == ["kill", "cleanup"]
+
+
+def test_zombies_do_not_count_as_surviving_processes(tmp_path, monkeypatch):
+    proc = tmp_path / "proc"
+    for pid, state, uid in [("10", "Z (zombie)", 29606), ("11", "S (sleeping)", 29606), ("12", "S (sleeping)", 1000)]:
+        (proc / pid).mkdir(parents=True)
+        (proc / pid / "status").write_text(f"Name:\tx\nState:\t{state}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+    monkeypatch.setattr(mcp_management, "PROC_ROOT", str(proc))
+
+    assert mcp_management.processes_of_uid(29606) == [11]

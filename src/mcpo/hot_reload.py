@@ -269,8 +269,9 @@ class MCPHotReloader:
             survivors = set()
             for server_id in removed | modified:
                 logger.info(f"🛑 Stopping server: {server_id}")
-                await self._stop_server(server_id)
                 try:
+                    await kill_stdio_processes(server_id)
+                    await self._stop_server(server_id)
                     await kill_stdio_processes(server_id)
                 except RuntimeError as e:
                     logger.error(f"❌ {e}; its uid stays assigned")
@@ -372,6 +373,10 @@ class MCPHotReloader:
 
         Raises RuntimeError when processes of its uid survive.
         """
+        # Kill first: a client cleanup waits for a process that ignores EOF
+        # and can't signal it (another uid), so it would hang. Kill again
+        # after the cleanup in case anything restarted meanwhile.
+        await kill_stdio_processes(server_id)
         await self._stop_server(server_id)
         await kill_stdio_processes(server_id)
         if self.current_config:
