@@ -66,3 +66,60 @@ def test_cli_stdio_server_gets_only_its_given_environment(monkeypatch):
         )
 
     assert_minimal(asyncio.run(scenario()).state.env)
+
+
+WRAPPER = ["/usr/local/sbin/run-as-tools", "--reuid=1001", "--"]
+
+
+def capturing_stdio(seen):
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def client(params, *args, **kwargs):
+        seen.append(params)
+        raise RuntimeError("not connecting in tests")
+        yield  # pragma: no cover
+
+    return client
+
+
+def test_config_stdio_servers_run_through_the_wrapper(tmp_path, monkeypatch):
+    import mcpo.main
+
+    monkeypatch.setenv("MCPO_STDIO_WRAPPER", json.dumps(WRAPPER))
+    seen = []
+    monkeypatch.setattr(mcpo.main, "stdio_client", capturing_stdio(seen))
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"mcpServers": {"tool": SERVER}}))
+    monkeypatch.setattr(mcp_management, "CONFIG_PATH", str(path))
+
+    async def scenario():
+        app = build_app(api_key="k", cors_allow_origins=[], config_path=str(path))
+        sub = next(r.app for r in app.routes if getattr(r, "path", "") == "/tool")
+        try:
+            async with sub.router.lifespan_context(sub):
+                pass
+        except RuntimeError:
+            pass
+
+    asyncio.run(scenario())
+    assert seen[0].command == WRAPPER[0]
+    assert seen[0].args == WRAPPER[1:] + ["npx", "-y", "pkg"]
+
+
+def test_hot_added_stdio_servers_run_through_the_wrapper(tmp_path, monkeypatch):
+    import mcp.client.stdio
+
+    monkeypatch.setenv("MCPO_STDIO_WRAPPER", json.dumps(WRAPPER))
+    seen = []
+    monkeypatch.setattr(mcp.client.stdio, "stdio_client", capturing_stdio(seen))
+    reloader = MCPHotReloader(FastAPI(), str(tmp_path / "config.json"))
+
+    async def no_session(*_args):
+        return None
+
+    monkeypatch.setattr(reloader, "_initialize_server_session", no_session)
+    asyncio.run(reloader._start_server("tool", SERVER))
+
+    assert seen[0].command == WRAPPER[0]
+    assert seen[0].args == WRAPPER[1:] + ["npx", "-y", "pkg"]

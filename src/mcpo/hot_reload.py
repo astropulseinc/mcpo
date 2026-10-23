@@ -22,7 +22,12 @@ except ImportError:
     FileSystemEventHandler = None
     FileModifiedEvent = None
 
-from .mcp_management import describe_server_config, loggable_url, stdio_environment
+from .mcp_management import (
+    describe_server_config,
+    loggable_url,
+    stdio_command,
+    stdio_environment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -565,9 +570,10 @@ class MCPHotReloader:
             
             logger.info(f"🔗 Establishing stdio connection: {command} ({len(args)} args)")
             
+            wrapped_command, wrapped_args = stdio_command(command, args)
             server_params = StdioServerParameters(
-                command=command,
-                args=args,
+                command=wrapped_command,
+                args=wrapped_args,
                 env={**env}
             )
             

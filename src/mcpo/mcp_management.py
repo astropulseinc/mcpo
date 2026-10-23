@@ -176,6 +176,20 @@ def stdio_environment(server_env: dict[str, str] | None) -> dict[str, str]:
     return {**base, **(server_env or {})}
 
 
+def stdio_command(command: str, args: list[str]) -> tuple[str, list[str]]:
+    """The command line that starts a stdio server.
+
+    MCPO_STDIO_WRAPPER, a JSON list, is put in front of every stdio command,
+    e.g. a launcher that runs the server as a separate unprivileged user.
+    """
+    wrapper = json.loads(os.environ.get("MCPO_STDIO_WRAPPER") or "[]")
+    if not wrapper:
+        return command, list(args)
+    if not isinstance(wrapper, list) or not all(isinstance(part, str) for part in wrapper):
+        raise ValueError("MCPO_STDIO_WRAPPER must be a JSON list of strings")
+    return wrapper[0], [*wrapper[1:], command, *args]
+
+
 def loggable_url(url: Any) -> str:
     """A URL without user info, query or fragment, safe to log."""
     from urllib.parse import urlsplit

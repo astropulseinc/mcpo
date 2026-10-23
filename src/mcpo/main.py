@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 from mcpo.utils.main import get_model_fields, get_tool_handler
 from mcpo.utils.auth import get_verify_api_key, APIKeyMiddleware
-from mcpo.mcp_management import loggable_url, stdio_environment
+from mcpo.mcp_management import loggable_url, stdio_command, stdio_environment
 
 
 async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
@@ -136,9 +136,10 @@ async def lifespan(app: FastAPI):
                         pass
     else:
         if server_type == "stdio":
+            wrapped_command, wrapped_args = stdio_command(command, args)
             server_params = StdioServerParameters(
-                command=command,
-                args=args,
+                command=wrapped_command,
+                args=wrapped_args,
                 env={**env},
             )
 
