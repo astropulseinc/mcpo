@@ -210,36 +210,97 @@ def stdio_environment(server_env: dict[str, str] | None) -> dict[str, str]:
     return {**base, **(server_env or {})}
 
 
-# uid -> server id, for the stdio servers this process has started.
-_STDIO_UIDS: dict[int, str] = {}
+# Server id -> uid assignments, kept in memory when MCPO_STDIO_UID_MAP is unset.
+_MEMORY_UID_MAP: dict[str, Any] = {"assigned": {}, "retired": []}
 
 
-def stdio_uid(server_id: str) -> int:
-    """The uid a stdio server runs as: fixed per server id, from MCPO_STDIO_UID_POOL ("first:count").
-
-    Two running servers never share a uid; a server whose uid is taken is refused.
-    """
+def _uid_hash(server_id: str) -> int:
     import hashlib
 
+    return int(hashlib.sha256(server_id.encode("utf-8")).hexdigest(), 16)
+
+
+def _uid_pool() -> tuple[int, int]:
     pool = os.environ.get("MCPO_STDIO_UID_POOL", "")
     try:
         first, count = (int(part) for part in pool.split(":"))
     except ValueError:
         raise ValueError("MCPO_STDIO_UID_POOL must be 'first:count' when MCPO_STDIO_WRAPPER uses {uid}")
-    digest = int(hashlib.sha256(server_id.encode("utf-8")).hexdigest(), 16)
-    uid = first + digest % count
-    holder = _STDIO_UIDS.get(uid)
-    if holder is not None and holder != server_id:
-        raise ValueError(f"stdio uid {uid} for {server_id} is already used by {holder}; rename one server")
-    _STDIO_UIDS[uid] = server_id
+    return first, count
+
+
+def _load_uid_map() -> dict[str, Any]:
+    path = os.environ.get("MCPO_STDIO_UID_MAP")
+    if not path:
+        return _MEMORY_UID_MAP
+    if not os.path.exists(path):
+        return {"assigned": {}, "retired": []}
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    data.setdefault("assigned", {})
+    data.setdefault("retired", [])
+    return data
+
+
+def _save_uid_map(data: dict[str, Any]) -> None:
+    path = os.environ.get("MCPO_STDIO_UID_MAP")
+    if not path:
+        return
+    tmp = f"{path}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def stdio_package(command: str, args: list[str]) -> str:
+    """What a stdio server runs: its command and first non-flag argument (the npx package)."""
+    package = next((arg for arg in args if not str(arg).startswith("-")), "")
+    return f"{command} {package}".strip()
+
+
+def stdio_uid(server_id: str, package: str | None = None) -> int:
+    """The uid a stdio server runs as, from MCPO_STDIO_UID_POOL ("first:count").
+
+    An id keeps its uid (persisted in MCPO_STDIO_UID_MAP, owner-only), and no
+    other id ever gets it: a taken uid is skipped by probing to the next free
+    one, and the uid of a deleted server is retired, never reassigned. An id
+    whose package changed gets a fresh uid (and so a fresh home).
+    """
+    first, count = _uid_pool()
+    data = _load_uid_map()
+    assigned, retired = data["assigned"], data["retired"]
+    entry = assigned.get(server_id)
+    if entry and package and entry.get("package") and entry["package"] != package:
+        retired.append(entry["uid"])
+        del assigned[server_id]
+        entry = None
+    if entry:
+        uid = entry["uid"]
+        if package and not entry.get("package"):
+            entry["package"] = package
+    else:
+        taken = {item["uid"] for item in assigned.values()} | set(retired)
+        start = _uid_hash(server_id) % count
+        uid = next(
+            (first + (start + step) % count for step in range(count) if first + (start + step) % count not in taken),
+            None,
+        )
+        if uid is None:
+            raise ValueError(f"stdio uid pool {first}:{count} is exhausted; no uid for {server_id}")
+        assigned[server_id] = {"uid": uid, "package": package}
+    _save_uid_map(data)
     return uid
 
 
-def release_stdio_uid(server_id: str) -> None:
-    """Free the uid of a stopped stdio server."""
-    for uid, holder in list(_STDIO_UIDS.items()):
-        if holder == server_id:
-            del _STDIO_UIDS[uid]
+def retire_stdio_uid(server_id: str) -> None:
+    """A deleted server's uid (and home) is never given to another server."""
+    data = _load_uid_map()
+    entry = data["assigned"].pop(server_id, None)
+    if entry:
+        data["retired"].append(entry["uid"])
+        _save_uid_map(data)
 
 
 def stdio_command(command: str, args: list[str], server_id: str = "default") -> tuple[str, list[str]]:
@@ -256,7 +317,7 @@ def stdio_command(command: str, args: list[str], server_id: str = "default") -> 
     if not isinstance(wrapper, list) or not all(isinstance(part, str) for part in wrapper):
         raise ValueError("MCPO_STDIO_WRAPPER must be a JSON list of strings")
     if any("{uid}" in part for part in wrapper):
-        uid = str(stdio_uid(server_id))
+        uid = str(stdio_uid(server_id, stdio_package(command, args)))
         wrapper = [part.replace("{uid}", uid) for part in wrapper]
     wrapper = [part.replace("{server_id}", server_id) for part in wrapper]
     return wrapper[0], [*wrapper[1:], command, *args]
@@ -916,6 +977,8 @@ def apply_monkey_patch(app):
         """Remove MCP server"""
         result = remove_mcp_server(server_id)
         if result["success"]:
+            # A server added later under this id starts with a fresh home.
+            retire_stdio_uid(server_id)
             return {"message": result["message"]}
         else:
             raise HTTPException(status_code=404, detail=result["error"])

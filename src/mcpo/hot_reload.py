@@ -25,7 +25,6 @@ except ImportError:
 from .mcp_management import (
     describe_server_config,
     loggable_url,
-    release_stdio_uid,
     stdio_command,
     stdio_environment,
 )
@@ -346,7 +345,6 @@ class MCPHotReloader:
                 await self._cleanup_background_tasks(server_id)
                 
                 del self._sessions[server_id]
-                release_stdio_uid(server_id)
                 logger.info(f"✅ Gracefully stopped MCP server: {server_id}")
         except Exception as e:
             logger.error(f"Failed to stop server {server_id}: {e}")
