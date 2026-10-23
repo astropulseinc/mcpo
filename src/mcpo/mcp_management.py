@@ -380,7 +380,13 @@ async def kill_stdio_processes(server_id: str) -> None:
         return
     uid = entry["uid"]
     argv = [part.replace("{uid}", str(uid)) for part in command]
-    if not await asyncio.to_thread(_kill_until_gone, argv, uid):
+    import subprocess
+
+    try:
+        gone = await asyncio.to_thread(_kill_until_gone, argv, uid)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise RuntimeError(f"killing the processes of server {server_id} (uid {uid}) failed: {e}")
+    if not gone:
         raise RuntimeError(f"processes of server {server_id} (uid {uid}) survived SIGKILL")
 
 

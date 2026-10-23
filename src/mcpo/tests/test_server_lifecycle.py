@@ -2,8 +2,10 @@
 
 import asyncio
 import json
+import subprocess
 from contextlib import asynccontextmanager
 
+import pytest
 from starlette.routing import Mount
 
 import mcpo.main
@@ -202,3 +204,76 @@ def test_zombies_do_not_count_as_surviving_processes(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_management, "PROC_ROOT", str(proc))
 
     assert mcp_management.processes_of_uid(29606) == [11]
+
+
+def reload_with_kill_failures(tmp_path, monkeypatch, old, new, failing, error):
+    from fastapi import FastAPI
+
+    import mcpo.hot_reload
+    from mcpo.hot_reload import MCPHotReloader
+
+    monkeypatch.setenv("MCPO_STDIO_UID_POOL", "20000:10000")
+    monkeypatch.setenv("MCPO_STDIO_UID_MAP", str(tmp_path / "uids.json"))
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"mcpServers": new}))
+    reloader = MCPHotReloader(FastAPI(), str(path))
+    reloader.current_config = {"mcpServers": dict(old)}
+    started = []
+
+    async def kill(server_id):
+        if server_id in failing:
+            raise error
+
+    async def noop(*_args):
+        return None
+
+    async def start(server_id, config):
+        started.append(server_id)
+
+    monkeypatch.setattr(mcpo.hot_reload, "kill_stdio_processes", kill)
+    monkeypatch.setattr(reloader, "_stop_server", noop)
+    monkeypatch.setattr(reloader, "_start_server", start)
+    uids = {sid: mcp_management.stdio_uid(sid, "npx x") for sid in old}
+    asyncio.run(reloader._reload_servers())
+    retired = json.loads((tmp_path / "uids.json").read_text())["retired"]
+    return reloader, started, uids, retired
+
+
+def test_a_removed_server_whose_processes_survive_stays_tracked(tmp_path, monkeypatch):
+    reloader, _started, uids, retired = reload_with_kill_failures(
+        tmp_path, monkeypatch, old={"a": SERVERS["one"], "b": SERVERS["two"]}, new={}, failing={"a"},
+        error=RuntimeError("survived"),
+    )
+
+    assert "a" in reloader.current_config["mcpServers"]
+    assert "b" not in reloader.current_config["mcpServers"]
+    assert uids["a"] not in retired and uids["b"] in retired
+    assert reloader.stop_failed == {"a"}
+
+
+def test_a_modified_server_whose_processes_survive_is_not_started_again(tmp_path, monkeypatch):
+    changed = {"command": "npx", "args": ["-y", "pkg-one", "--flag"]}
+    reloader, started, _uids, _retired = reload_with_kill_failures(
+        tmp_path, monkeypatch, old={"a": SERVERS["one"], "b": SERVERS["two"]},
+        new={"a": changed, "b": {**SERVERS["two"], "args": ["-y", "pkg-two", "--x"]}}, failing={"a"},
+        error=RuntimeError("survived"),
+    )
+
+    assert started == ["b"]
+    assert reloader.current_config["mcpServers"]["a"] == SERVERS["one"]
+
+
+@pytest.mark.parametrize("error", [subprocess.TimeoutExpired("kill", 10), OSError("no launcher")])
+def test_kill_command_errors_are_survivors_and_the_reload_completes(tmp_path, monkeypatch, error):
+    monkeypatch.setenv("MCPO_STDIO_KILL_COMMAND", json.dumps(["kill-it", "{uid}"]))
+    monkeypatch.setenv("MCPO_STDIO_UID_POOL", "20000:10000")
+    monkeypatch.setenv("MCPO_STDIO_UID_MAP", str(tmp_path / "uids.json"))
+    mcp_management.stdio_uid("a", "npx x")
+
+    def raise_error(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(mcp_management, "_kill_until_gone", raise_error)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(mcp_management.kill_stdio_processes("a"))

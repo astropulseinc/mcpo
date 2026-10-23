@@ -139,6 +139,7 @@ class MCPHotReloader:
         self.observer = None
         self.current_config = None
         self._sessions = {}  # Store active MCP sessions
+        self.stop_failed: set = set()  # Stopped servers whose processes survived
         
         # Track start time for uptime calculation
         import time
@@ -265,29 +266,35 @@ class MCPHotReloader:
                 self.current_config = new_config
                 return
             
-            # Stop removed/modified servers
+            # Stop removed/modified servers. A server whose processes survive
+            # is a survivor: not started again (no second instance), its uid
+            # not retired, and it stays in current_config under its old
+            # config so the next reload (or a DELETE) retries the stop.
             survivors = set()
             for server_id in removed | modified:
                 logger.info(f"🛑 Stopping server: {server_id}")
-                try:
-                    await kill_stdio_processes(server_id)
-                    await self._stop_server(server_id)
-                    await kill_stdio_processes(server_id)
-                except RuntimeError as e:
-                    logger.error(f"❌ {e}; its uid stays assigned")
+                if await self.stop_server_processes(server_id):
+                    self.stop_failed.discard(server_id)
+                else:
                     survivors.add(server_id)
             # A removed server's uid is retired after its processes are gone,
             # so a server added later under this id gets a fresh home.
             for server_id in removed - survivors:
                 retire_stdio_uid(server_id)
-            
-            # Start added/modified servers
-            for server_id in added | modified:
+
+            # Start added/modified servers (never a survivor)
+            for server_id in (added | modified) - survivors:
                 server_config = new_config["mcpServers"][server_id]
                 logger.info(f"🚀 Starting server: {server_id} ({describe_server_config(server_config)})")
-                await self._start_server(server_id, server_config)
-            
-            self.current_config = new_config
+                try:
+                    await self._start_server(server_id, server_config)
+                except Exception as e:
+                    logger.error(f"❌ Failed to start {server_id}: {e}")
+
+            tracked = json.loads(json.dumps(new_config))
+            for server_id in survivors:
+                tracked.setdefault("mcpServers", {})[server_id] = self.current_config["mcpServers"][server_id]
+            self.current_config = tracked
             
             logger.info(f"✅ ZERO-DOWNTIME RELOAD COMPLETED SUCCESSFULLY")
             logger.info(f"📊 Final state - Added: {added}, Removed: {removed}, Modified: {modified}")
@@ -367,6 +374,23 @@ class MCPHotReloader:
                 logger.info(f"✅ Stopped MCP server started at boot: {server_id}")
         except Exception as e:
             logger.error(f"Failed to stop server {server_id}: {e}")
+
+    async def stop_server_processes(self, server_id: str) -> bool:
+        """Kill, clean up, kill again; True when no process of the server is left.
+
+        On failure the server is recorded in stop_failed: unmounted, not
+        running tools, and retried by the next reload or DELETE.
+        """
+        try:
+            await kill_stdio_processes(server_id)
+            await self._stop_server(server_id)
+            await kill_stdio_processes(server_id)
+        except RuntimeError as e:
+            logger.error(f"❌ {e}; its uid stays assigned, and the stop will be retried")
+            self.stop_failed.add(server_id)
+            return False
+        self.stop_failed.discard(server_id)
+        return True
 
     async def stop_server(self, server_id: str):
         """Stop a server now, whether it started at boot or by hot reload.
