@@ -161,6 +161,18 @@ def redact_secrets(value: Any) -> Any:
     return value
 
 
+# The only proxy variables a stdio server inherits; secrets in the proxy's
+# environment (its API key, the AstroPulse key, LLM keys) stay out of
+# third-party processes.
+_STDIO_BASE_ENV = ("PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "TZ")
+
+
+def stdio_environment(server_env: dict[str, str] | None) -> dict[str, str]:
+    """Environment for a stdio server: a minimal base plus its own config env."""
+    base = {key: os.environ[key] for key in _STDIO_BASE_ENV if key in os.environ}
+    return {**base, **(server_env or {})}
+
+
 def loggable_url(url: Any) -> str:
     """A URL without user info, query or fragment, safe to log."""
     from urllib.parse import urlsplit

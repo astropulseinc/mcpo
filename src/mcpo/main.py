@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 from mcpo.utils.main import get_model_fields, get_tool_handler
 from mcpo.utils.auth import get_verify_api_key, APIKeyMiddleware
-from mcpo.mcp_management import loggable_url
+from mcpo.mcp_management import loggable_url, stdio_environment
 
 
 async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
@@ -424,7 +424,7 @@ def build_app(
                 sub_app.state.server_type = "stdio"
                 sub_app.state.command = server_cfg["command"]
                 sub_app.state.args = server_cfg.get("args", [])
-                sub_app.state.env = {**os.environ, **server_cfg.get("env", {})}
+                sub_app.state.env = stdio_environment(server_cfg.get("env"))
 
             server_config_type = server_cfg.get("type")
             if server_config_type == "sse" and server_cfg.get("url"):

@@ -22,7 +22,7 @@ except ImportError:
     FileSystemEventHandler = None
     FileModifiedEvent = None
 
-from .mcp_management import describe_server_config, loggable_url
+from .mcp_management import describe_server_config, loggable_url, stdio_environment
 
 logger = logging.getLogger(__name__)
 
@@ -369,7 +369,6 @@ class MCPHotReloader:
             # Create a new sub-app for this server. CORS and the API key come
             # from the main app's middleware, which also wraps mounted apps.
             from fastapi import FastAPI
-            import os
             
             # Import lifespan from main module
             from .main import lifespan
@@ -387,7 +386,7 @@ class MCPHotReloader:
                 sub_app.state.server_type = "stdio"
                 sub_app.state.command = config["command"]
                 sub_app.state.args = config.get("args", [])
-                sub_app.state.env = {**os.environ, **config.get("env", {})}
+                sub_app.state.env = stdio_environment(config.get("env"))
             elif config.get("type") == "sse" and config.get("url"):
                 # SSE server
                 sub_app.state.server_type = "sse"
