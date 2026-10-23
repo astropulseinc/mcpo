@@ -718,8 +718,20 @@ def _get_mcp_tools_count(server_id: str, app=None) -> Dict[str, Any]:
         logger.error(f"Failed to get MCP tools count for {server_id}: {e}")
         return {"count": 0, "method": "error", "error": str(e)}
 
+def _stop_failed(app) -> set:
+    """Servers that were stopped but whose processes survived (see the hot reloader)."""
+    reloader = getattr(getattr(app, "state", None), "hot_reloader", None)
+    return set(getattr(reloader, "stop_failed", set()))
+
+
 def test_mcp_server(server_id: str, app=None) -> Dict[str, Any]:
     """Test if MCP server is actually loaded and working in MCPO"""
+    if server_id in _stop_failed(app):
+        return {
+            "success": False,
+            "message": "Server is stopped (no tools served), but some of its processes survive; retry the delete",
+            "status": "stop_failed",
+        }
     try:
         config = load_config()
         
@@ -1012,7 +1024,11 @@ def apply_monkey_patch(app):
         """List all MCP servers"""
         result = list_mcp_servers()
         if result["success"]:
-            return redact_secrets(result["servers"])
+            servers = redact_secrets(result["servers"])
+            for server_id in _stop_failed(app):
+                if server_id in servers:
+                    servers[server_id]["status"] = "stop_failed"
+            return servers
         else:
             raise HTTPException(status_code=500, detail=result["error"])
     
@@ -1093,7 +1109,13 @@ def apply_monkey_patch(app):
                 await reloader.stop_server(server_id)
             except RuntimeError as e:
                 logger.error(f"Not removing {server_id}: {e}")
-                raise HTTPException(status_code=500, detail=f"Could not stop server {server_id}; nothing was removed")
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"Server {server_id} is stopped (no tools served) but some of its processes survive; "
+                        "it was not removed. Retry the delete."
+                    ),
+                )
         result = remove_mcp_server(server_id)
         if result["success"]:
             retire_stdio_uid(server_id)
@@ -1158,7 +1180,7 @@ def apply_monkey_patch(app):
         if result["success"]:
             return {"message": result["message"], "status": result.get("status", "unknown"), "tool_count": result.get("tool_count"), "success": True}
         else:
-            return {"message": result.get("message", "Unknown error"), "status": "error", "success": False}
+            return {"message": result.get("message", "Unknown error"), "status": "stop_failed" if result.get("status") == "stop_failed" else "error", "success": False}
     
     @app.get("/api/mcp/servers/{server_id}/health")
     async def get_server_health(server_id: str):
@@ -1167,7 +1189,7 @@ def apply_monkey_patch(app):
         if result["success"]:
             return {"status": result.get("status", "unknown"), "message": result["message"], "tool_count": result.get("tool_count")}
         else:
-            return {"status": "error", "message": result.get("message", "Unknown error")}
+            return {"status": "stop_failed" if result.get("status") == "stop_failed" else "error", "message": result.get("message", "Unknown error")}
     
     # Marketplace endpoints (API-driven implementation)
     @app.get("/api/marketplace/templates")

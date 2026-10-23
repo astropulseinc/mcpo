@@ -277,3 +277,40 @@ def test_kill_command_errors_are_survivors_and_the_reload_completes(tmp_path, mo
 
     with pytest.raises(RuntimeError):
         asyncio.run(mcp_management.kill_stdio_processes("a"))
+
+
+def test_a_delete_whose_processes_survive_reports_the_server_stopped(tmp_path, monkeypatch):
+    survivors = [4242]
+    kill_setup(tmp_path, monkeypatch, survivors=survivors)
+    uid = mcp_management.stdio_uid("one", "npx pkg-one")
+    calls = {"n": 0}
+    real = mcp_management._kill_until_gone
+
+    def first_ok_then_survive(argv, kill_uid, attempts=5):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return True
+        return real(argv, kill_uid, attempts)
+
+    monkeypatch.setattr(mcp_management, "_kill_until_gone", first_ok_then_survive)
+    seen = {}
+
+    async def scenario(app, events):
+        from httpx import ASGITransport, AsyncClient
+
+        headers = {"Authorization": "Bearer k"}
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            first = await client.delete("/api/mcp/servers/one", headers=headers)
+            seen["first"] = (first.status_code, first.json()["detail"])
+            seen["listed"] = (await client.get("/api/mcp/servers", headers=headers)).json()["one"].get("status")
+            seen["health"] = (await client.get("/api/mcp/servers/one/health", headers=headers)).json()["status"]
+            survivors.clear()
+            seen["retry"] = (await client.delete("/api/mcp/servers/one", headers=headers)).status_code
+
+    run_startup(tmp_path, monkeypatch, scenario)
+
+    assert seen["first"][0] == 500 and "stopped" in seen["first"][1]
+    assert seen["listed"] == "stop_failed"
+    assert seen["health"] == "stop_failed"
+    assert seen["retry"] == 200
+    assert uid in json.loads((tmp_path / "uids.json").read_text())["retired"]

@@ -400,9 +400,8 @@ class MCPHotReloader:
         # Kill first: a client cleanup waits for a process that ignores EOF
         # and can't signal it (another uid), so it would hang. Kill again
         # after the cleanup in case anything restarted meanwhile.
-        await kill_stdio_processes(server_id)
-        await self._stop_server(server_id)
-        await kill_stdio_processes(server_id)
+        if not await self.stop_server_processes(server_id):
+            raise RuntimeError(f"processes of server {server_id} survived")
         if self.current_config:
             self.current_config.get("mcpServers", {}).pop(server_id, None)
     
