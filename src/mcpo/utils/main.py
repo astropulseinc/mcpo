@@ -382,13 +382,13 @@ def get_tool_handler(
                         else {"message": e.error.message}
                     ),
                 )
-            except Exception as e:
+            except Exception:
                 logger.info(
                     f"Unexpected error calling {endpoint_name}: {traceback.format_exc()}"
                 )
                 raise HTTPException(
                     status_code=500,
-                    detail={"message": "Unexpected error", "error": str(e)},
+                    detail={"message": "Unexpected error"},
                 )
 
         return tool
@@ -437,13 +437,13 @@ def get_tool_handler(
                     else {"message": e.error.message}
                 ),
             )
-        except Exception as e:
+        except Exception:
             logger.info(
                 f"Unexpected error calling {endpoint_name}: {traceback.format_exc()}"
             )
             raise HTTPException(
                 status_code=500,
-                detail={"message": "Unexpected error", "error": str(e)},
+                detail={"message": "Unexpected error"},
             )
 
     return tool

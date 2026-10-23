@@ -13,6 +13,8 @@ import base64
 
 logger = logging.getLogger(__name__)
 
+INTERNAL_ERROR = "Internal error; see the nova-proxy logs"
+
 ENV_CONFIG_PATH = os.environ.get("NOVA_ENV_CONFIG_PATH", "/opt/nova/environment.json")
 
 def load_environment_config() -> Dict[str, Any]:
@@ -64,7 +66,7 @@ def store_environment_variable(key: str, value: str, scope: str = "global",
         
     except Exception as e:
         logger.error(f"Failed to store environment variable {key}: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def get_environment_variable(key: str, scope: str = "global", 
                            server_id: Optional[str] = None) -> Optional[str]:
@@ -121,7 +123,7 @@ def list_environment_variables(scope: str = "global",
         
     except Exception as e:
         logger.error(f"Failed to list environment variables: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def delete_environment_variable(key: str, scope: str = "global", 
                               server_id: Optional[str] = None) -> Dict[str, Any]:
@@ -140,7 +142,7 @@ def delete_environment_variable(key: str, scope: str = "global",
             
     except Exception as e:
         logger.error(f"Failed to delete environment variable {key}: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def get_variable_templates() -> Dict[str, Any]:
     """Get predefined variable templates"""
@@ -230,7 +232,7 @@ def validate_variable(key: str, value: str) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Failed to validate variable {key}: {e}")
-        return {"valid": False, "message": f"Validation failed: {str(e)}"}
+        return {"valid": False, "message": "Validation failed"}
 
 def apply_environment_patch(app):
     """Add environment management endpoints to the app"""

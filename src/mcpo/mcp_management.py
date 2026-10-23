@@ -22,6 +22,8 @@ except ImportError:
     logger.warning("PyYAML not available, will use JSON fallback for templates")
 
 import tempfile
+INTERNAL_ERROR = "Internal error; see the nova-proxy logs"
+
 CONFIG_PATH = os.environ.get("NOVA_CONFIG_PATH", "/opt/nova/config.json")
 MARKETPLACE_CONFIG_PATH = os.environ.get("NOVA_MARKETPLACE_CONFIG_PATH", "/opt/nova/marketplace_servers.json")
 MARKETPLACE_TEMPLATES_PATH = os.environ.get("NOVA_MARKETPLACE_TEMPLATES_PATH", "../../nova-proxy/marketplace-templates.yaml")
@@ -218,7 +220,7 @@ def add_mcp_server(server_id: str, config: Dict[str, Any], add_to_marketplace: b
         
     except Exception as e:
         logger.error(f"Failed to add MCP server {server_id}: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def remove_mcp_server(server_id: str, force: bool = False) -> Dict[str, Any]:
     """Remove an MCP server"""
@@ -256,7 +258,7 @@ def remove_mcp_server(server_id: str, force: bool = False) -> Dict[str, Any]:
             
     except Exception as e:
         logger.error(f"Failed to remove MCP server {server_id}: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def list_mcp_servers() -> Dict[str, Any]:
     """List all MCP servers"""
@@ -296,7 +298,7 @@ def list_mcp_servers() -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Failed to list MCP servers: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def get_mcp_server(server_id: str) -> Dict[str, Any]:
     """Get specific MCP server configuration"""
@@ -319,7 +321,7 @@ def get_mcp_server(server_id: str) -> Dict[str, Any]:
             
     except Exception as e:
         logger.error(f"Failed to get MCP server {server_id}: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def toggle_mcp_server(server_id: str, enabled: bool) -> Dict[str, Any]:
     """Enable/disable an MCP server"""
@@ -349,45 +351,33 @@ def toggle_mcp_server(server_id: str, enabled: bool) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Failed to toggle MCP server {server_id}: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
-def _test_underlying_connectivity(server_id: str, config: Dict[str, Any]) -> Dict[str, Any]:
-    """Test the underlying connectivity (SSE/command) of an MCP server"""
+def _mounted_app(server_id: str, app=None):
+    """The sub-app mounted for a server, if any."""
+    for route in getattr(app, "routes", []) or []:
+        if getattr(route, "path", None) == f"/{server_id}" and hasattr(route, "app"):
+            return route.app
+    return None
+
+
+def _test_underlying_connectivity(server_id: str, config: Dict[str, Any], app=None) -> Dict[str, Any]:
+    """Check a server without opening new connections to it.
+
+    SSE servers are judged by their live MCP session; command servers by
+    the command being installed.
+    """
     try:
         server_config = config["mcpServers"][server_id]
-        
+
         if server_config.get("type") == "sse" and server_config.get("url"):
-            # Properly test SSE endpoint
-            import httpx
-            try:
-                with httpx.Client(timeout=5.0) as client:
-                    # SSE endpoints should accept text/event-stream
-                    headers = {
-                        "Accept": "text/event-stream",
-                        "Cache-Control": "no-cache"
-                    }
-                    with client.stream("GET", server_config["url"], headers=headers) as response:
-                        # Check status and content-type
-                        if response.status_code >= 400:
-                            return {"success": False, "message": f"SSE endpoint returned {response.status_code}"}
-                        
-                        content_type = response.headers.get("content-type", "")
-                        if "text/event-stream" not in content_type:
-                            return {"success": False, "message": f"SSE endpoint has wrong content-type: {content_type}"}
-                        
-                        # Try to read first event/line to verify it's streaming
-                        for line in response.iter_lines():
-                            if line:  # Got some data, SSE is working
-                                return {"success": True, "message": "SSE endpoint streaming"}
-                            break  # Exit after first line
-                        
-                        return {"success": True, "message": "SSE endpoint responding"}
-                        
-            except httpx.ConnectError as e:
-                return {"success": False, "message": f"SSE connection failed: {str(e)}"}
-            except Exception as e:
-                return {"success": False, "message": f"SSE test error: {str(e)}"}
-        
+            state = getattr(_mounted_app(server_id, app), "state", None)
+            if state is None or not getattr(state, "session", None):
+                return {"success": False, "message": "no live MCP session"}
+            if getattr(state, "connection_status", None) in ("unhealthy", "failed"):
+                return {"success": False, "message": "MCP session is unhealthy"}
+            return {"success": True, "message": "MCP session active"}
+
         elif server_config.get("command"):
             # Test if command exists and is working
             import shutil
@@ -396,11 +386,13 @@ def _test_underlying_connectivity(server_id: str, config: Dict[str, Any]) -> Dic
                 return {"success": True, "message": f"command '{command}' available"}
             else:
                 return {"success": False, "message": f"command '{command}' not found"}
-        
+
         return {"success": True, "message": "no connectivity test needed"}
-        
+
     except Exception as e:
-        return {"success": False, "message": f"connectivity test failed: {str(e)}"}
+        logger.error(f"Connectivity test failed for {server_id}: {e}")
+        return {"success": False, "message": "connectivity test failed"}
+
 
 def _get_mcp_tools_count(server_id: str, app=None) -> Dict[str, Any]:
     """Get actual MCP tools count via tools/list API call"""
@@ -466,7 +458,7 @@ def test_mcp_server(server_id: str, app=None) -> Dict[str, Any]:
                             
                             # If we have an active MCP session but count is unknown, show that
                             if mcp_result.get("count") == -1:
-                                connectivity_result = _test_underlying_connectivity(server_id, config)
+                                connectivity_result = _test_underlying_connectivity(server_id, config, app)
                                 return {
                                     "success": True,
                                     "message": f"MCP session active, connectivity OK - {mcp_result.get('message', '')}",
@@ -479,7 +471,7 @@ def test_mcp_server(server_id: str, app=None) -> Dict[str, Any]:
                             if tool_count == 0:
                                 # For SSE servers, check if connectivity is OK even with 0 tools
                                 # This handles the case where SSE connection works but async lifecycle has issues
-                                connectivity_result = _test_underlying_connectivity(server_id, config)
+                                connectivity_result = _test_underlying_connectivity(server_id, config, app)
                                 if connectivity_result["success"] and server_config.get("type") == "sse":
                                     return {
                                         "success": True,
@@ -499,7 +491,7 @@ def test_mcp_server(server_id: str, app=None) -> Dict[str, Any]:
                             
                             # Server is mounted AND has tools - now test underlying connectivity
                             if tool_count > 0:
-                                connectivity_result = _test_underlying_connectivity(server_id, config)
+                                connectivity_result = _test_underlying_connectivity(server_id, config, app)
                                 if connectivity_result["success"]:
                                     return {
                                         "success": True,
@@ -520,7 +512,7 @@ def test_mcp_server(server_id: str, app=None) -> Dict[str, Any]:
             
             if server_mounted:
                 # Server mounted but no tools - test connectivity
-                connectivity_result = _test_underlying_connectivity(server_id, config)
+                connectivity_result = _test_underlying_connectivity(server_id, config, app)
                 if connectivity_result["success"]:
                     return {"success": True, "message": "Server mounted, connectivity OK", "status": "loaded"}
                 else:
@@ -545,7 +537,7 @@ def test_mcp_server(server_id: str, app=None) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Failed to test MCP server {server_id}: {e}")
-        return {"success": False, "message": str(e), "status": "error"}
+        return {"success": False, "message": INTERNAL_ERROR, "status": "error"}
 
 def reload_individual_server(server_id: str, app=None) -> Dict[str, Any]:
     """Reload a specific MCP server (bypass exponential backoff)"""
@@ -594,7 +586,7 @@ def reload_individual_server(server_id: str, app=None) -> Dict[str, Any]:
             
     except Exception as e:
         logger.error(f"Failed to reload individual server {server_id}: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def reload_mcp_servers(app=None, use_hot_reload=True) -> Dict[str, Any]:
     """Reload all MCP servers using hot reload or fallback to restart"""
@@ -669,7 +661,7 @@ def reload_mcp_servers(app=None, use_hot_reload=True) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Failed to reload MCP servers: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": INTERNAL_ERROR}
 
 def apply_monkey_patch(app):
     """Apply monkey patch to add MCP management endpoints"""
@@ -758,7 +750,8 @@ def apply_monkey_patch(app):
                     "method": "process_restart"
                 }
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Force restart failed: {str(e)}")
+                logger.error(f"Force restart failed: {e}")
+                raise HTTPException(status_code=500, detail="Force restart failed")
         else:
             # Normal reload
             result = reload_mcp_servers(app=app, use_hot_reload=True)
@@ -833,7 +826,8 @@ def apply_monkey_patch(app):
                     "method": "process_restart"
                 }
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Force restart failed: {str(e)}")
+                logger.error(f"Force restart failed: {e}")
+                raise HTTPException(status_code=500, detail="Force restart failed")
         else:
             # Normal reload
             result = reload_individual_server(server_id, app=app)
@@ -1356,7 +1350,8 @@ def apply_monkey_patch(app):
                     }
                 }
         except Exception as e:
-            return {"error": f"Failed to generate OpenAPI schema: {str(e)}"}
+            logger.error(f"Failed to generate OpenAPI schema: {e}")
+            return {"error": "Failed to generate OpenAPI schema"}
     
     # Add API documentation endpoint
     @app.get("/docs", response_class=HTMLResponse)

@@ -841,7 +841,8 @@ def apply_hot_reload_patch(app, config_path: str):
                     healthy_servers += 1
                     
             except Exception as e:
-                server_statuses[server_id] = {"status": "error", "message": str(e)}
+                logger.error(f"Health check failed for {server_id}: {e}")
+                server_statuses[server_id] = {"status": "error", "message": "health check failed"}
         
         health_ratio = healthy_servers / total_servers if total_servers > 0 else 1.0
         

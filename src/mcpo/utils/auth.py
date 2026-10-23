@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 import base64
 import hmac
+import logging
 
 from passlib.context import CryptContext
 from datetime import UTC, datetime, timedelta
@@ -11,6 +12,8 @@ from datetime import UTC, datetime, timedelta
 import jwt
 from typing import Optional, Union, List, Dict
 
+
+logger = logging.getLogger(__name__)
 
 ALGORITHM = "HS256"
 
@@ -106,8 +109,9 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                 )
 
             return await call_next(request)
-        except Exception as e:
-            return JSONResponse(status_code=500, content={"detail": str(e)})
+        except Exception:
+            logger.exception("Request failed behind the API-key middleware")
+            return JSONResponse(status_code=500, content={"detail": "Internal error"})
 
 
 # def create_token(data: dict, expires_delta: Union[timedelta, None] = None) -> str:
