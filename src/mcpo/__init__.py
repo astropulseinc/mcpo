@@ -29,7 +29,8 @@ def main(
     strict_auth: Annotated[
         Optional[bool],
         typer.Option(
-            "--strict-auth", help="API key protects all endpoints and documentation"
+            "--strict-auth",
+            help="Kept for compatibility: the API key always protects every endpoint",
         ),
     ] = False,
     env: Annotated[

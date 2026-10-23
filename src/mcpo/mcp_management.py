@@ -7,6 +7,7 @@ Adds dynamic MCP server management capabilities to mcpo
 import json
 import os
 import logging
+import re
 import time
 from typing import Dict, Any, List
 from pathlib import Path
@@ -94,9 +95,58 @@ def load_marketplace_templates() -> Dict[str, Any]:
         logger.error(f"Failed to load marketplace templates: {e}")
         return {}
 
+
+SERVER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_PLACEHOLDER_PATTERN = re.compile(r"^\{\{[A-Za-z0-9_]+\}\}$")
+
+
+def _is_placeholder(arg: Any) -> bool:
+    return isinstance(arg, str) and bool(_PLACEHOLDER_PATTERN.match(arg))
+
+
+def _args_match(template_args: list[Any], args: list[Any]) -> bool:
+    """Literal template args must appear in order; a {{placeholder}} takes one or more args."""
+    if not template_args:
+        return not args
+    head, rest = template_args[0], template_args[1:]
+    if _is_placeholder(head):
+        return any(_args_match(rest, args[n:]) for n in range(1, len(args) + 1))
+    return bool(args) and args[0] == head and _args_match(rest, args[1:])
+
+
+def find_verified_template(config: dict[str, Any], templates: dict[str, Any]) -> str | None:
+    """Return the id of the verified template whose command this config runs, if any."""
+    command = config.get("command")
+    args = config.get("args") or []
+    env_keys = set((config.get("env") or {}).keys())
+    for template_id, template in templates.items():
+        template_config = (template or {}).get("config_template") or {}
+        if not template_config.get("command") or template_config["command"] != command:
+            continue
+        if not _args_match(template_config.get("args") or [], args):
+            continue
+        if env_keys <= set((template_config.get("env") or {}).keys()):
+            return template_id
+    return None
+
+
+def validate_server_config(server_id: str, config: dict[str, Any]) -> str | None:
+    """Return why a server config may not be stored, or None when it may."""
+    if not SERVER_ID_PATTERN.match(server_id or ""):
+        return "Server id may contain only letters, digits, '-' and '_' (at most 64)"
+    if config.get("command") and find_verified_template(config, load_marketplace_templates()) is None:
+        return "A command server must match a verified marketplace template (command, arguments and environment keys)"
+    return None
+
+
 def add_mcp_server(server_id: str, config: Dict[str, Any], add_to_marketplace: bool = False) -> Dict[str, Any]:
     """Add a new MCP server dynamically"""
     try:
+        error = validate_server_config(server_id, config)
+        if error:
+            logger.warning(f"Rejected MCP server config for {server_id}: {error}")
+            return {"success": False, "error": error}
+
         # Load current config
         current_config = load_config()
         
@@ -1062,6 +1112,11 @@ def apply_monkey_patch(app):
                 config["env"] = {}
             config["env"].update(install_request.environment_vars)
         
+        error = validate_server_config(server_id, config)
+        if error:
+            logger.warning(f"Rejected marketplace install of {server_id}: {error}")
+            raise HTTPException(status_code=400, detail=error)
+
         # Validate required environment variables exist
         if required_vars:
             from mcpo.environment_management import list_environment_variables
@@ -1118,7 +1173,10 @@ def apply_monkey_patch(app):
         
         # Get server config
         server_config = current_config["mcpServers"][server_id]
-        
+        error = validate_server_config(server_id, server_config)
+        if error:
+            raise HTTPException(status_code=400, detail=error)
+
         # Add to marketplace
         marketplace_servers = load_marketplace_servers()
         marketplace_servers[server_id] = {

@@ -364,9 +364,9 @@ class MCPHotReloader:
         try:
             logger.info(f"Starting MCP server {server_id} with config: {config}")
             
-            # Create a new sub-app for this server
+            # Create a new sub-app for this server. CORS and the API key come
+            # from the main app's middleware, which also wraps mounted apps.
             from fastapi import FastAPI
-            from fastapi.middleware.cors import CORSMiddleware
             import os
             
             # Import lifespan from main module
@@ -377,15 +377,6 @@ class MCPHotReloader:
                 description=f"{server_id} MCP Server\n\n- [back to tool list](/docs)",
                 version="1.0",
                 lifespan=lifespan,
-            )
-            
-            # Configure CORS
-            sub_app.add_middleware(
-                CORSMiddleware,
-                allow_origins=["*"],
-                allow_credentials=True,
-                allow_methods=["*"],
-                allow_headers=["*"],
             )
             
             # Configure server based on type

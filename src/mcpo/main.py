@@ -257,16 +257,24 @@ async def lifespan(app: FastAPI):
                     yield
 
 
-async def run(
-    host: str = "127.0.0.1",
-    port: int = 8000,
+def cors_options(cors_allow_origins) -> dict:
+    """CORS settings; credentials are never allowed together with a wildcard origin."""
+    origins = list(cors_allow_origins or [])
+    return {
+        "allow_origins": origins,
+        "allow_credentials": "*" not in origins,
+        "allow_methods": ["*"],
+        "allow_headers": ["*"],
+    }
+
+
+def build_app(
     api_key: Optional[str] = "",
-    cors_allow_origins=["*"],
+    cors_allow_origins=None,
     **kwargs,
-):
-    # Server API Key
+) -> FastAPI:
+    """Build the mcpo app with its middleware, management APIs and MCP servers."""
     api_dependency = get_verify_api_key(api_key) if api_key else None
-    strict_auth = kwargs.get("strict_auth", False)
 
     # MCP Server
     server_type = kwargs.get(
@@ -288,24 +296,6 @@ async def run(
     ssl_keyfile = kwargs.get("ssl_keyfile")
     path_prefix = kwargs.get("path_prefix") or "/"
 
-    # Configure basic logging
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-    )
-    logger.info("Starting MCPO Server...")
-    logger.info(f"  Name: {name}")
-    logger.info(f"  Version: {version}")
-    logger.info(f"  Description: {description}")
-    logger.info(f"  Hostname: {socket.gethostname()}")
-    logger.info(f"  Port: {port}")
-    logger.info(f"  API Key: {'Provided' if api_key else 'Not Provided'}")
-    logger.info(f"  CORS Allowed Origins: {cors_allow_origins}")
-    if ssl_certfile:
-        logger.info(f"  SSL Certificate File: {ssl_certfile}")
-    if ssl_keyfile:
-        logger.info(f"  SSL Key File: {ssl_keyfile}")
-    logger.info(f"  Path Prefix: {path_prefix}")
-
     main_app = FastAPI(
         title=name,
         description=description,
@@ -315,43 +305,43 @@ async def run(
         lifespan=lifespan,
     )
 
-    main_app.add_middleware(
-        CORSMiddleware,
-        allow_origins=cors_allow_origins or ["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # Add middleware to protect also documentation and spec
-    if api_key and strict_auth:
+    # The key guards every route, including docs, mounted servers (also those
+    # added by hot reload) and the management APIs.
+    if api_key:
         main_app.add_middleware(APIKeyMiddleware, api_key=api_key)
 
-    # Add Nova MCP Marketplace APIs
-    try:
-        logger.info("Adding Nova MCP Marketplace APIs...")
-        from mcpo.mcp_management import apply_monkey_patch
-        from mcpo.environment_management import apply_environment_patch
-        apply_monkey_patch(main_app)
-        apply_environment_patch(main_app)
-        logger.info("✅ Nova MCP Marketplace APIs added successfully!")
-        
-        # Enable hot reload for zero-downtime config changes
-        if config_path:
-            logger.info("Enabling hot reload for zero-downtime config changes...")
-            try:
-                from mcpo.hot_reload import apply_hot_reload_patch
-                apply_hot_reload_patch(main_app, config_path)
-                logger.info("✅ Zero-downtime hot reload enabled!")
-            except ImportError as e:
-                logger.warning(f"Full hot reload dependencies not available ({e}), falling back to simple hot reload...")
-                from mcpo.simple_hot_reload import apply_simple_hot_reload
-                apply_simple_hot_reload(main_app, config_path)
-                logger.info("✅ Simple hot reload enabled!")
-        else:
-            logger.info("Note: Hot reload disabled (no config file provided)")
-    except Exception as e:
-        logger.warning(f"Failed to add marketplace APIs: {e}")
+    # Added last so it runs first: preflights and 401s carry CORS headers.
+    main_app.add_middleware(CORSMiddleware, **cors_options(cors_allow_origins))
+
+    # The management APIs start processes and edit server configs, so they
+    # exist only behind an API key.
+    if api_key:
+        try:
+            logger.info("Adding Nova MCP Marketplace APIs...")
+            from mcpo.mcp_management import apply_monkey_patch
+            from mcpo.environment_management import apply_environment_patch
+            apply_monkey_patch(main_app)
+            apply_environment_patch(main_app)
+            logger.info("✅ Nova MCP Marketplace APIs added successfully!")
+
+            # Enable hot reload for zero-downtime config changes
+            if config_path:
+                logger.info("Enabling hot reload for zero-downtime config changes...")
+                try:
+                    from mcpo.hot_reload import apply_hot_reload_patch
+                    apply_hot_reload_patch(main_app, config_path)
+                    logger.info("✅ Zero-downtime hot reload enabled!")
+                except ImportError as e:
+                    logger.warning(f"Full hot reload dependencies not available ({e}), falling back to simple hot reload...")
+                    from mcpo.simple_hot_reload import apply_simple_hot_reload
+                    apply_simple_hot_reload(main_app, config_path)
+                    logger.info("✅ Simple hot reload enabled!")
+            else:
+                logger.info("Note: Hot reload disabled (no config file provided)")
+        except Exception as e:
+            logger.warning(f"Failed to add marketplace APIs: {e}")
+    else:
+        logger.warning("No API key configured: the management APIs are disabled")
 
     if server_type == "sse":
         logger.info(
@@ -428,14 +418,6 @@ async def run(
                 lifespan=lifespan,
             )
 
-            sub_app.add_middleware(
-                CORSMiddleware,
-                allow_origins=cors_allow_origins or ["*"],
-                allow_credentials=True,
-                allow_methods=["*"],
-                allow_headers=["*"],
-            )
-
             if server_cfg.get("command"):
                 # stdio
                 sub_app.state.server_type = "stdio"
@@ -463,10 +445,6 @@ async def run(
                 sub_app.state.server_type = "sse"
                 sub_app.state.args = server_cfg["url"]
 
-            # Add middleware to protect also documentation and spec
-            if api_key and strict_auth:
-                sub_app.add_middleware(APIKeyMiddleware, api_key=api_key)
-
             sub_app.state.api_dependency = api_dependency
 
             main_app.mount(f"{path_prefix}{server_name}", sub_app)
@@ -474,6 +452,48 @@ async def run(
     else:
         logger.error("MCPO server_command or config_path must be provided.")
         raise ValueError("You must provide either server_command or config.")
+
+    return main_app
+
+
+
+async def run(
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    api_key: Optional[str] = "",
+    cors_allow_origins=["*"],
+    **kwargs,
+):
+    name = kwargs.get("name") or "MCP OpenAPI Proxy"
+    version = kwargs.get("version") or "1.0"
+    description = (
+        kwargs.get("description") or "Automatically generated API from MCP Tool Schemas"
+    )
+    ssl_certfile = kwargs.get("ssl_certfile")
+    ssl_keyfile = kwargs.get("ssl_keyfile")
+    path_prefix = kwargs.get("path_prefix") or "/"
+
+    # Configure basic logging
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+    logger.info("Starting MCPO Server...")
+    logger.info(f"  Name: {name}")
+    logger.info(f"  Version: {version}")
+    logger.info(f"  Description: {description}")
+    logger.info(f"  Hostname: {socket.gethostname()}")
+    logger.info(f"  Port: {port}")
+    logger.info(f"  API Key: {'Provided' if api_key else 'Not Provided'}")
+    logger.info(f"  CORS Allowed Origins: {cors_allow_origins}")
+    if ssl_certfile:
+        logger.info(f"  SSL Certificate File: {ssl_certfile}")
+    if ssl_keyfile:
+        logger.info(f"  SSL Key File: {ssl_keyfile}")
+    logger.info(f"  Path Prefix: {path_prefix}")
+
+    main_app = build_app(
+        api_key=api_key, cors_allow_origins=cors_allow_origins, **kwargs
+    )
 
     logger.info("Uvicorn server starting...")
     config = uvicorn.Config(

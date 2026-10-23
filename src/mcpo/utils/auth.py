@@ -3,6 +3,7 @@ from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 import base64
+import hmac
 
 from passlib.context import CryptContext
 from datetime import UTC, datetime, timedelta
@@ -14,6 +15,14 @@ from typing import Optional, Union, List, Dict
 ALGORITHM = "HS256"
 
 bearer_security = HTTPBearer(auto_error=False)
+
+# Basic first, so a browser opening the UI prompts for the key as the password.
+WWW_AUTHENTICATE = 'Basic realm="mcpo", Bearer'
+
+
+def key_matches(candidate: str, api_key: str) -> bool:
+    """Compare a presented key with the configured one in constant time."""
+    return hmac.compare_digest(candidate.encode("utf-8"), api_key.encode("utf-8"))
 
 
 def get_verify_api_key(api_key: str):
@@ -27,7 +36,7 @@ def get_verify_api_key(api_key: str):
                 headers={"WWW-Authenticate": "Bearer"},
             )
         token = authorization.credentials
-        if token != api_key:
+        if not key_matches(token, api_key):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Invalid API key",
@@ -60,13 +69,13 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                 return JSONResponse(
                     status_code=401,
                     content={"detail": "Missing or invalid Authorization header"},
-                    headers={"WWW-Authenticate": "Bearer, Basic"},
+                    headers={"WWW-Authenticate": WWW_AUTHENTICATE},
                 )
 
             # Handle Bearer token auth
             if authorization.startswith("Bearer "):
                 token = authorization[7:]  # Remove "Bearer " prefix
-                if token != self.api_key:
+                if not key_matches(token, self.api_key):
                     return JSONResponse(
                         status_code=403, content={"detail": "Invalid API key"}
                     )
@@ -79,7 +88,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                     # Basic auth format is username:password
                     username, password = decoded.split(":", 1)
                     # Any username is allowed, but password must match api_key
-                    if password != self.api_key:
+                    if not key_matches(password, self.api_key):
                         return JSONResponse(
                             status_code=403, content={"detail": "Invalid credentials"}
                         )
@@ -87,13 +96,13 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                     return JSONResponse(
                         status_code=401,
                         content={"detail": "Invalid Basic Authentication format"},
-                        headers={"WWW-Authenticate": "Bearer, Basic"},
+                        headers={"WWW-Authenticate": WWW_AUTHENTICATE},
                     )
             else:
                 return JSONResponse(
                     status_code=401,
                     content={"detail": "Unsupported authorization method"},
-                    headers={"WWW-Authenticate": "Bearer, Basic"},
+                    headers={"WWW-Authenticate": WWW_AUTHENTICATE},
                 )
 
             return await call_next(request)
