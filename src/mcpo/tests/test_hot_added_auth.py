@@ -1,3 +1,4 @@
+import pytest
 import asyncio
 import json
 
@@ -71,3 +72,21 @@ def test_the_management_key_still_calls_tools(tmp_path, monkeypatch):
 
     ok = client.post("/backend/echo", json={"value": "x"}, headers={"Authorization": f"Bearer {API_KEY}"})
     assert ok.status_code == 200
+
+
+@pytest.mark.parametrize("path", ["/docsearch/echo", "/docs-mcp/echo", "/redocly/echo", "/apiary/echo", "/staticfiles/echo"])
+def test_server_ids_that_start_like_management_paths_are_tool_paths(path):
+    from mcpo.utils.auth import is_management_path
+
+    assert not is_management_path(path)
+
+
+@pytest.mark.parametrize("path", ["/", "/api/mcp/servers", "/static/x.js", "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"])
+def test_management_paths_match_whole_segments(path):
+    from mcpo.utils.auth import is_management_path
+
+    assert is_management_path(path)
+
+
+def test_redoc_is_a_reserved_server_id():
+    assert mcp_management.validate_server_config("redoc", {"type": "sse", "url": "http://a/"})

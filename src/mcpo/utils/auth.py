@@ -38,11 +38,13 @@ def any_key_matches(candidate: str, keys) -> bool:
 
 # Routes only the management key may use; every other path is a mounted
 # MCP server, where the tool key is accepted too.
-MANAGEMENT_PATHS = ("/api/", "/static/", "/docs", "/redoc", "/openapi.json")
+MANAGEMENT_SEGMENTS = {"api", "static", "docs", "redoc", "openapi.json"}
 
 
 def is_management_path(path: str) -> bool:
-    return path == "/" or path.startswith(MANAGEMENT_PATHS)
+    """True for / and for paths whose first segment is a management route."""
+    first = path.lstrip("/").split("/", 1)[0]
+    return first == "" or first in MANAGEMENT_SEGMENTS
 
 
 def read_key_file(path: str) -> str:

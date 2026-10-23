@@ -98,7 +98,7 @@ def load_marketplace_templates() -> Dict[str, Any]:
         return {}
 
 
-RESERVED_SERVER_IDS = {"reload", "api", "static", "docs", "openapi.json"}
+RESERVED_SERVER_IDS = {"reload", "api", "static", "docs", "redoc", "openapi.json"}
 SERVER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _PLACEHOLDER_PATTERN = re.compile(r"^\{\{[A-Za-z0-9_]+\}\}$")
 
