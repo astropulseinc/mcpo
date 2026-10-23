@@ -1025,7 +1025,12 @@ def apply_monkey_patch(app):
         result = list_mcp_servers()
         if result["success"]:
             servers = redact_secrets(result["servers"])
+            reloader = getattr(app.state, "hot_reloader", None)
+            tracked = (getattr(reloader, "current_config", None) or {}).get("mcpServers", {})
             for server_id in _stop_failed(app):
+                if server_id not in servers and server_id in tracked:
+                    # Removed from the config, but its processes outlived the stop.
+                    servers[server_id] = {**redact_secrets(tracked[server_id]), "is_default": False}
                 if server_id in servers:
                     servers[server_id]["status"] = "stop_failed"
             return servers
@@ -1104,7 +1109,9 @@ def apply_monkey_patch(app):
         # retire its uid, so a server added later under this id starts with
         # a fresh home.
         reloader = getattr(app.state, "hot_reloader", None)
-        if reloader and server_id in load_config().get("mcpServers", {}):
+        configured = server_id in load_config().get("mcpServers", {})
+        was_survivor = server_id in _stop_failed(app)
+        if reloader and (configured or was_survivor):
             try:
                 await reloader.stop_server(server_id)
             except RuntimeError as e:
@@ -1116,6 +1123,12 @@ def apply_monkey_patch(app):
                         "it was not removed. Retry the delete."
                     ),
                 )
+        if not configured and was_survivor:
+            # A removed server whose earlier stop failed: now stopped.
+            tracked = (getattr(reloader, "current_config", None) or {}).get("mcpServers", {})
+            tracked.pop(server_id, None)
+            retire_stdio_uid(server_id)
+            return {"message": f"Server {server_id} stopped and removed"}
         result = remove_mcp_server(server_id)
         if result["success"]:
             retire_stdio_uid(server_id)

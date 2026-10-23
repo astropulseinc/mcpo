@@ -241,6 +241,10 @@ class MCPHotReloader:
             # This ensures that delete->add cycles are properly handled
             logger.info("🔄 Processing config change (file modification detected)")
             
+            # Retry stops that failed before, whatever this change is (even
+            # none: a config reverted to a failed server's old config).
+            await self._retry_failed_stops(new_config)
+
             old_servers = set(self.current_config.get("mcpServers", {}).keys())
             new_servers = set(new_config.get("mcpServers", {}).keys())
             
@@ -374,6 +378,26 @@ class MCPHotReloader:
                 logger.info(f"✅ Stopped MCP server started at boot: {server_id}")
         except Exception as e:
             logger.error(f"Failed to stop server {server_id}: {e}")
+
+    async def _retry_failed_stops(self, new_config: dict[str, Any]) -> None:
+        """Stop again every server whose stop failed. Once stopped, start it
+        under its current config if it is still configured, else retire its
+        uid and stop tracking it."""
+        for server_id in sorted(self.stop_failed):
+            if not await self.stop_server_processes(server_id):
+                continue
+            tracked = self.current_config.setdefault("mcpServers", {})
+            config = new_config.get("mcpServers", {}).get(server_id)
+            if config is None:
+                tracked.pop(server_id, None)
+                retire_stdio_uid(server_id)
+                continue
+            logger.info(f"🚀 Restarting {server_id} after its stop was retried")
+            try:
+                await self._start_server(server_id, config)
+            except Exception as e:
+                logger.error(f"❌ Failed to start {server_id}: {e}")
+            tracked[server_id] = config
 
     async def stop_server_processes(self, server_id: str) -> bool:
         """Kill, clean up, kill again; True when no process of the server is left.
