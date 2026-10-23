@@ -139,6 +139,40 @@ def validate_server_config(server_id: str, config: dict[str, Any]) -> str | None
     return None
 
 
+SECRET_MASK = "***HIDDEN***"
+_SECRET_FIELDS = ("env", "headers")
+
+
+def redact_secrets(value: Any) -> Any:
+    """Copy of a config (at any depth) with every env and header value masked."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                {name: SECRET_MASK for name in item}
+                if key in _SECRET_FIELDS and isinstance(item, dict)
+                else redact_secrets(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_secrets(item) for item in value]
+    return value
+
+
+def _restore_masked_secrets(config: dict[str, Any], stored: dict[str, Any] | None) -> None:
+    """Put stored values back where a client sent the mask it was shown."""
+    for field in _SECRET_FIELDS:
+        submitted = config.get(field)
+        if not isinstance(submitted, dict):
+            continue
+        previous = (stored or {}).get(field) or {}
+        config[field] = {
+            name: (previous[name] if value == SECRET_MASK else value)
+            for name, value in submitted.items()
+            if value != SECRET_MASK or name in previous
+        }
+
+
 def add_mcp_server(server_id: str, config: Dict[str, Any], add_to_marketplace: bool = False) -> Dict[str, Any]:
     """Add a new MCP server dynamically"""
     try:
@@ -149,7 +183,8 @@ def add_mcp_server(server_id: str, config: Dict[str, Any], add_to_marketplace: b
 
         # Load current config
         current_config = load_config()
-        
+        _restore_masked_secrets(config, current_config["mcpServers"].get(server_id))
+
         # Add to main config
         current_config["mcpServers"][server_id] = config
         save_config(current_config)
@@ -674,7 +709,7 @@ def apply_monkey_patch(app):
         """List all MCP servers"""
         result = list_mcp_servers()
         if result["success"]:
-            return result["servers"]
+            return redact_secrets(result["servers"])
         else:
             raise HTTPException(status_code=500, detail=result["error"])
     
@@ -720,7 +755,7 @@ def apply_monkey_patch(app):
         """Get specific MCP server"""
         result = get_mcp_server(server_id)
         if result["success"]:
-            return result["server"]
+            return redact_secrets(result["server"])
         else:
             raise HTTPException(status_code=404, detail=result["error"])
     
@@ -832,8 +867,7 @@ def apply_monkey_patch(app):
     @app.get("/api/marketplace/custom")
     async def get_custom_servers():
         """Get user's custom servers (non-verified)"""
-        custom_servers = load_marketplace_servers()
-        return custom_servers
+        return redact_secrets(load_marketplace_servers())
     
     @app.get("/api/marketplace/servers")
     async def get_marketplace_servers(category: str = Query(None)):
@@ -855,7 +889,7 @@ def apply_monkey_patch(app):
             all_servers[server_id] = template_copy
         
         # Add custom servers (mark as unverified)
-        for server_id, custom in custom_servers.items():
+        for server_id, custom in redact_secrets(custom_servers).items():
             custom_copy = custom.copy()
             custom_copy["verified"] = False
             custom_copy["source"] = "custom"
@@ -984,7 +1018,7 @@ def apply_monkey_patch(app):
     @app.get("/api/marketplace/servers/{server_id}")
     async def get_marketplace_server(server_id: str):
         """Get marketplace server details"""
-        marketplace_servers = await get_marketplace_servers()
+        marketplace_servers = await get_marketplace_servers(category=None)
         if server_id in marketplace_servers:
             return marketplace_servers[server_id]
         else:
@@ -1231,7 +1265,7 @@ def apply_monkey_patch(app):
                 "in_marketplace": True,
                 "type": "custom",
                 "can_modify": True,
-                "details": marketplace_servers[server_id]
+                "details": redact_secrets(marketplace_servers[server_id])
             }
         else:
             return {

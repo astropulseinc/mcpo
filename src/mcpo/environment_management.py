@@ -89,10 +89,9 @@ def get_environment_variable(key: str, scope: str = "global",
         logger.error(f"Failed to get environment variable {key}: {e}")
         return None
 
-def list_environment_variables(scope: str = "global", 
-                             server_id: Optional[str] = None, 
-                             show_values: bool = False) -> Dict[str, Any]:
-    """List environment variables"""
+def list_environment_variables(scope: str = "global",
+                             server_id: Optional[str] = None) -> Dict[str, Any]:
+    """List environment variables; sensitive values are always masked"""
     try:
         config = load_environment_config()
         variables = []
@@ -107,9 +106,7 @@ def list_environment_variables(scope: str = "global",
                 continue
             
             value = var_data["value"]
-            if show_values and var_data.get("sensitive", True):
-                value = simple_decrypt(value)
-            elif not show_values and var_data.get("sensitive", True):
+            if var_data.get("sensitive", True):
                 value = "***HIDDEN***"
             
             variables.append({
@@ -254,10 +251,9 @@ def apply_environment_patch(app):
     async def list_env_variables(
         scope: str = Query("global"),
         server_id: Optional[str] = Query(None),
-        show_values: bool = Query(False)
     ):
-        """List environment variables"""
-        result = list_environment_variables(scope, server_id, show_values)
+        """List environment variables (sensitive values are masked)"""
+        result = list_environment_variables(scope, server_id)
         if result["success"]:
             return result  # Return full result object with variables array
         else:
